@@ -84,7 +84,7 @@ def build_queries(
         },
     }
 
-    top_prefs = sorted(preferences.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_prefs = sorted([(k,v) for k,v in preferences.items() if isinstance(v, (int, float))], key=lambda x: x[1], reverse=True)[:3]
     pref_map  = pref_keywords.get(category, {})
     pref_str  = " ".join(pref_map[k] for k, _ in top_prefs if k in pref_map)
     age_str   = {"20s":"20대","30s":"30대","40s":"40대",

@@ -199,9 +199,14 @@ class AttractionBrowsingAgent:
             return None
 
         # 좌표 기반 소속 여행지 검증
-        from utils.feature_extractor import verify_place_belongs
+        from utils.feature_extractor import verify_place_belongs, _get_transit_score
         if not verify_place_belongs(place_name, features.lat, features.lng, dest):
             return None
+
+        # 카카오로 교통 접근성 실측값으로 덮어씌우기
+        transit_score, transit_desc = _get_transit_score(features.lat, features.lng)
+        features.transit_access = transit_score
+        self._log(f"  [교통] {transit_desc} → {transit_score}/5")
 
         score, breakdown = score_attraction(features, self.trip.preferences)
 

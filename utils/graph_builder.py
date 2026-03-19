@@ -107,9 +107,14 @@ def build_graph(
     return graph
 
 
+_printed_summaries = set()
+
 def print_graph_summary(graph: PlaceGraph):
-    import sys
-    out = sys.stdout
+    # 동일 그래프 중복 출력 방지
+    key = f"{graph.category}_{len(graph.nodes)}_{len(graph.edges)}"
+    if key in _printed_summaries:
+        return
+    _printed_summaries.add(key)
     print(f"\n{'='*50}", flush=True)
     print(f"그래프 요약 [{graph.category}]", flush=True)
     print(f"  노드: {len(graph.nodes)}개", flush=True)

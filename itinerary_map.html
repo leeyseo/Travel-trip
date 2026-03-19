@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>서울 여행 일정 지도</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@300;400;500;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --surface2: #242424;
+    --border: #2e2e2e;
+    --text: #e8e4dc;
+    --text-muted: #6b6b6b;
+    --accent: #c9a96e;
+
+    --day1: #e07b54;
+    --day2: #5b9bd5;
+    --day3: #6bc49a;
+    --day4: #c47fc4;
+
+    --hotel-color: #f0c040;
+    --attraction-color: #60b8f0;
+    --restaurant-color: #f07070;
+  }
+
+  body {
+    font-family: 'Noto Sans KR', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── 상단 헤더 ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 16px;
+  }
+
+  .header-left { display: flex; align-items: center; gap: 14px; }
+
+  .trip-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 0.04em;
+  }
+
+  .trip-meta {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+  }
+
+  /* ── Day 토글 버튼 ── */
+  .day-toggles {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .day-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 5px 12px;
+    border-radius: 20px;
+    border: 1.5px solid transparent;
+    cursor: pointer;
+    transition: all 0.18s ease;
+    letter-spacing: 0.05em;
+    background: var(--surface2);
+    color: var(--text-muted);
+  }
+
+  .day-btn[data-day="0"] { border-color: var(--text-muted); }
+  .day-btn[data-day="0"].active { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+  .day-btn[data-day="1"] { --dc: var(--day1); }
+  .day-btn[data-day="2"] { --dc: var(--day2); }
+  .day-btn[data-day="3"] { --dc: var(--day3); }
+  .day-btn[data-day="4"] { --dc: var(--day4); }
+
+  .day-btn[data-day]:not([data-day="0"]).active {
+    background: var(--dc);
+    color: #fff;
+    border-color: var(--dc);
+  }
+  .day-btn[data-day]:not([data-day="0"]):not(.active):hover {
+    border-color: var(--dc);
+    color: var(--dc);
+  }
+
+  /* ── 범례 ── */
+  .legend {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .legend-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  /* ── 지도 컨테이너 ── */
+  #map {
+    flex: 1;
+    width: 100%;
+  }
+
+  /* ── 사이드 패널 ── */
+  #side-panel {
+    position: absolute;
+    top: 60px;
+    left: 16px;
+    width: 280px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    z-index: 1000;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    transform: translateX(-320px);
+    transition: transform 0.25s cubic-bezier(0.4,0,0.2,1);
+  }
+
+  #side-panel.open { transform: translateX(0); }
+
+  .panel-header {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .panel-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text);
+    line-height: 1.3;
+  }
+
+  .panel-category {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 3px;
+  }
+
+  .close-btn {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 0;
+    flex-shrink: 0;
+    line-height: 1;
+  }
+  .close-btn:hover { color: var(--text); }
+
+  .panel-body { padding: 14px 16px; }
+
+  .panel-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+  .panel-row:last-child { border-bottom: none; }
+
+  .panel-label { color: var(--text-muted); }
+  .panel-value { color: var(--text); font-weight: 500; font-family: 'DM Mono', monospace; }
+
+  .score-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .score-track {
+    width: 80px; height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .score-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+  }
+
+  .panel-day-badge {
+    display: inline-block;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    color: #fff;
+    margin-top: 8px;
+  }
+
+  .panel-notes {
+    margin-top: 12px;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.6;
+    max-height: 80px;
+    overflow-y: auto;
+  }
+
+  /* ── Leaflet 커스텀 ── */
+  .leaflet-container { background: #1a1a1a; }
+
+  .leaflet-tile { filter: brightness(0.7) saturate(0.5); }
+
+  .custom-marker {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    border: 2.5px solid rgba(255,255,255,0.9);
+    font-size: 13px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+    transition: transform 0.15s ease;
+  }
+  .custom-marker:hover { transform: scale(1.2); }
+
+  .seq-label {
+    position: absolute;
+    top: -6px; right: -6px;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    color: #111;
+    font-size: 9px;
+    font-weight: 700;
+    font-family: 'DM Mono', monospace;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+
+  .leaflet-popup-content-wrapper {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+  }
+  .leaflet-popup-tip { background: var(--surface); }
+  .leaflet-popup-close-button { color: var(--text-muted) !important; }
+
+  /* 이동거리 배지 */
+  .dist-badge {
+    position: absolute;
+    bottom: 16px;
+    right: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    z-index: 900;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .dist-badge .dist-val {
+    font-size: 18px;
+    font-weight: 500;
+    color: var(--accent);
+    display: block;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <div>
+      <div class="trip-title" id="tripTitle">서울 여행 일정</div>
+      <div class="trip-meta" id="tripMeta">—</div>
+    </div>
+  </div>
+
+  <div class="day-toggles" id="dayToggles">
+    <button class="day-btn active" data-day="0">전체</button>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--hotel-color)"></div>숙소</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--attraction-color)"></div>관광지</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--restaurant-color)"></div>맛집</div>
+  </div>
+</header>
+
+<div id="map"></div>
+
+<div id="side-panel">
+  <div class="panel-header">
+    <div>
+      <div class="panel-name" id="panelName">—</div>
+      <div class="panel-category" id="panelCategory">—</div>
+      <div class="panel-day-badge" id="panelDayBadge"></div>
+    </div>
+    <button class="close-btn" onclick="closePanel()">✕</button>
+  </div>
+  <div class="panel-body" id="panelBody"></div>
+</div>
+
+<div class="dist-badge" id="distBadge" style="display:none">
+  <span class="dist-val" id="distVal">—</span>
+  일 이동거리
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ──────────────────────────────────────────────
+// JSON 로드 (파일 drag & drop 또는 인라인 데이터)
+// ──────────────────────────────────────────────
+
+// ★ 아래 ITINERARY_DATA에 itinerary JSON 파일 내용을 붙여넣으세요
+// 또는 HTML 파일과 같은 폴더에 JSON 파일을 두고 fetch로 로드
+const ITINERARY_JSON_PATH = null; // 예: './서울_itinerary_50s.json'
+
+// 인라인 fallback 데이터 (JSON 파일 경로 없을 때 사용)
+let ITINERARY_DATA = null;
+
+// ──────────────────────────────────────────────
+// 색상 & 아이콘 설정
+// ──────────────────────────────────────────────
+const DAY_COLORS = ['#e07b54','#5b9bd5','#6bc49a','#c47fc4','#e0c454'];
+const TYPE_ICONS = { hotel: '🏨', attraction: '📍', restaurant: '🍽️' };
+const TYPE_COLORS = { hotel: '#f0c040', attraction: '#60b8f0', restaurant: '#f07070' };
+const TYPE_SIZES  = { hotel: 36, attraction: 30, restaurant: 28 };
+
+// ──────────────────────────────────────────────
+// 지도 초기화
+// ──────────────────────────────────────────────
+const map = L.map('map', { zoomControl: false, attributionControl: false });
+
+L.control.zoom({ position: 'bottomleft' }).addTo(map);
+
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 19,
+}).addTo(map);
+
+// ──────────────────────────────────────────────
+// 상태
+// ──────────────────────────────────────────────
+let currentDay = 0; // 0 = 전체
+let allLayers = []; // { day, type, name, marker, polyline }
+let itinerary = [];
+let tripData = {};
+
+// ──────────────────────────────────────────────
+// 마커 생성
+// ──────────────────────────────────────────────
+function makeIcon(type, dayColor, seq) {
+  const size = TYPE_SIZES[type];
+  const color = TYPE_COLORS[type];
+  const icon = TYPE_ICONS[type];
+  const seqHtml = seq ? `<div class="seq-label">${seq}</div>` : '';
+  return L.divIcon({
+    html: `<div class="custom-marker" style="width:${size}px;height:${size}px;background:${color};border-color:${dayColor}20;">${icon}${seqHtml}</div>`,
+    className: '',
+    iconSize: [size, size],
+    iconAnchor: [size/2, size/2],
+    popupAnchor: [0, -size/2],
+  });
+}
+
+// ──────────────────────────────────────────────
+// 사이드 패널
+// ──────────────────────────────────────────────
+function openPanel(info) {
+  document.getElementById('panelName').textContent = info.name;
+  document.getElementById('panelCategory').textContent = info.category || '';
+  const badge = document.getElementById('panelDayBadge');
+  badge.textContent = `Day ${info.day}`;
+  badge.style.background = DAY_COLORS[info.day - 1] || '#888';
+
+  const body = document.getElementById('panelBody');
+  const rows = [];
+
+  if (info.type === 'hotel') {
+    rows.push(['1박 가격', `${info.price_per_night?.toLocaleString()}원`]);
+    rows.push(['교통 접근성', `${'★'.repeat(info.transit || 0)}${'☆'.repeat(5 - (info.transit || 0))}`]);
+    if (info.booking_url) {
+      rows.push(['예약', `<a href="${info.booking_url}" target="_blank" style="color:var(--accent)">Booking.com ↗</a>`]);
+    }
+  } else if (info.type === 'restaurant') {
+    rows.push(['가격 (1인)', `${info.price?.toLocaleString() || '정보없음'}원`]);
+    rows.push(['소요 시간', `${info.duration_hr}시간`]);
+    if (info.score) rows.push(['점수', `<span class="score-bar"><span class="score-track"><span class="score-fill" style="width:${info.score*100}%"></span></span>${(info.score*100).toFixed(0)}점</span>`]);
+  } else {
+    if (info.price !== undefined) rows.push(['입장료', info.price > 0 ? `${info.price.toLocaleString()}원` : '무료']);
+    rows.push(['소요 시간', `${info.duration_hr}시간`]);
+    if (info.score) rows.push(['점수', `<span class="score-bar"><span class="score-track"><span class="score-fill" style="width:${info.score*100}%"></span></span>${(info.score*100).toFixed(0)}점</span>`]);
+  }
+
+  body.innerHTML = rows.map(([label, val]) =>
+    `<div class="panel-row"><span class="panel-label">${label}</span><span class="panel-value">${val}</span></div>`
+  ).join('');
+
+  if (info.notes) {
+    body.innerHTML += `<div class="panel-notes">${info.notes.replace(/^#.*\n/,'').trim()}</div>`;
+  }
+
+  document.getElementById('side-panel').classList.add('open');
+}
+
+function closePanel() {
+  document.getElementById('side-panel').classList.remove('open');
+}
+
+// ──────────────────────────────────────────────
+// 이동거리 계산
+// ──────────────────────────────────────────────
+function haversine(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const d1 = (lat2-lat1)*Math.PI/180, d2 = (lng2-lng1)*Math.PI/180;
+  const a = Math.sin(d1/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(d2/2)**2;
+  return R * 2 * Math.asin(Math.sqrt(a));
+}
+
+function calcDayDist(day) {
+  const spots = [day.hotel, ...day.morning, ...(day.afternoon||[])];
+  let dist = 0;
+  for (let i = 0; i < spots.length - 1; i++) {
+    dist += haversine(spots[i].lat, spots[i].lng, spots[i+1].lat, spots[i+1].lng);
+  }
+  dist += haversine(spots[spots.length-1].lat, spots[spots.length-1].lng, day.hotel.lat, day.hotel.lng);
+  return dist;
+}
+
+// ──────────────────────────────────────────────
+// 일정 렌더링
+// ──────────────────────────────────────────────
+function renderItinerary(data) {
+  itinerary = data.itinerary;
+  tripData = data.trip;
+
+  // 헤더 업데이트
+  document.getElementById('tripTitle').textContent =
+    `${tripData.destination} 여행 — ${tripData.age_group} ${tripData.traveler_count}인`;
+  document.getElementById('tripMeta').textContent =
+    `${tripData.duration_days}박 · 예산 ${(tripData.budget_krw/10000).toFixed(0)}만원 · ${tripData.checkin}`;
+
+  // Day 토글 버튼 생성
+  const toggles = document.getElementById('dayToggles');
+  toggles.innerHTML = '<button class="day-btn active" data-day="0">전체</button>';
+  itinerary.forEach((day, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'day-btn';
+    btn.dataset.day = day.day;
+    btn.textContent = `Day ${day.day}`;
+    btn.style.setProperty('--dc', DAY_COLORS[i]);
+    toggles.appendChild(btn);
+  });
+
+  document.querySelectorAll('.day-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.day-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      currentDay = parseInt(btn.dataset.day);
+      updateVisibility();
+    });
+  });
+
+  // 레이어 초기화
+  allLayers.forEach(l => {
+    if (l.marker) map.removeLayer(l.marker);
+    if (l.polyline) map.removeLayer(l.polyline);
+  });
+  allLayers = [];
+
+  const bounds = [];
+  const hotelCache = {}; // 중복 숙소 마커 방지
+
+  itinerary.forEach((day, di) => {
+    const dayColor = DAY_COLORS[di];
+    const dayNum = day.day;
+
+    // ── 동선 순서: 숙소 → 오전 → 점심 → 오후 → 저녁 → 숙소
+    const route = [
+      { ...day.hotel, type: 'hotel' },
+      ...day.morning.map(a => ({ ...a, type: 'attraction' })),
+      ...(day.lunch ? [{ ...day.lunch, type: 'restaurant' }] : []),
+      ...(day.afternoon || []).map(a => ({ ...a, type: 'attraction' })),
+      ...(day.dinner ? [{ ...day.dinner, type: 'restaurant' }] : []),
+      { ...day.hotel, type: 'hotel' },
+    ];
+
+    // 경로선
+    const latlngs = route.map(p => [p.lat, p.lng]);
+    const polyline = L.polyline(latlngs, {
+      color: dayColor,
+      weight: 2.5,
+      opacity: 0.7,
+      dashArray: '6 4',
+    }).addTo(map);
+
+    allLayers.push({ day: dayNum, type: 'line', marker: null, polyline });
+
+    // 마커
+    let seq = 1;
+    route.forEach((place, pi) => {
+      if (pi === route.length - 1) return; // 마지막 숙소 중복 제거
+      if (place.type === 'hotel' && hotelCache[place.name]) return;
+      if (place.type === 'hotel') hotelCache[place.name] = true;
+
+      const icon = makeIcon(place.type, dayColor, place.type !== 'hotel' ? seq++ : null);
+      const marker = L.marker([place.lat, place.lng], { icon }).addTo(map);
+
+      const info = {
+        ...place,
+        day: dayNum,
+        notes: place.type === 'hotel' ? day.notes : null,
+      };
+
+      marker.on('click', () => openPanel(info));
+      bounds.push([place.lat, place.lng]);
+      allLayers.push({ day: dayNum, type: place.type, marker, polyline: null });
+    });
+  });
+
+  if (bounds.length) map.fitBounds(bounds, { padding: [40, 40] });
+}
+
+// ──────────────────────────────────────────────
+// 표시/숨김 토글
+// ──────────────────────────────────────────────
+function updateVisibility() {
+  allLayers.forEach(l => {
+    const show = currentDay === 0 || l.day === currentDay;
+    if (l.marker) {
+      if (show) map.addLayer(l.marker);
+      else map.removeLayer(l.marker);
+    }
+    if (l.polyline) {
+      if (show) map.addLayer(l.polyline);
+      else map.removeLayer(l.polyline);
+    }
+  });
+
+  // 이동거리 배지
+  const badge = document.getElementById('distBadge');
+  if (currentDay > 0 && itinerary.length) {
+    const day = itinerary.find(d => d.day === currentDay);
+    if (day) {
+      const dist = calcDayDist(day);
+      document.getElementById('distVal').textContent = `${dist.toFixed(1)} km`;
+      badge.style.display = 'block';
+    }
+  } else {
+    badge.style.display = 'none';
+  }
+
+  closePanel();
+}
+
+// ──────────────────────────────────────────────
+// 데이터 로드
+// ──────────────────────────────────────────────
+async function loadData() {
+  // 1순위: HTML과 같은 폴더의 JSON 파일
+  if (ITINERARY_JSON_PATH) {
+    try {
+      const res = await fetch(ITINERARY_JSON_PATH);
+      const data = await res.json();
+      renderItinerary(data);
+      return;
+    } catch(e) {
+      console.warn('JSON 파일 로드 실패:', e);
+    }
+  }
+
+  // 2순위: 인라인 데이터
+  if (ITINERARY_DATA) {
+    renderItinerary(ITINERARY_DATA);
+    return;
+  }
+
+  // 3순위: drag & drop 안내
+  showDropzone();
+}
+
+function showDropzone() {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = `
+    position:absolute; inset:0; z-index:2000;
+    background:rgba(15,15,15,0.92);
+    display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:16px;
+    font-family:'DM Mono',monospace;
+  `;
+  overlay.innerHTML = `
+    <div style="font-size:48px">📂</div>
+    <div style="font-size:16px;color:#e8e4dc;font-weight:500">JSON 파일을 여기에 드래그하세요</div>
+    <div style="font-size:12px;color:#6b6b6b">서울_itinerary_*.json</div>
+    <div style="font-size:11px;color:#444;margin-top:8px">
+      또는 HTML 파일 상단의 ITINERARY_JSON_PATH에 파일 경로를 입력하세요
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  overlay.addEventListener('dragover', e => { e.preventDefault(); overlay.style.background='rgba(201,169,110,0.1)'; });
+  overlay.addEventListener('dragleave', () => { overlay.style.background='rgba(15,15,15,0.92)'; });
+  overlay.addEventListener('drop', e => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        overlay.remove();
+        renderItinerary(data);
+      } catch(err) {
+        alert('JSON 파싱 오류: ' + err.message);
+      }
+    };
+    reader.readAsText(file, 'utf-8');
+  });
+}
+
+loadData();
+</script>
+</body>
+</html>

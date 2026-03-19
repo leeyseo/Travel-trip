@@ -7,6 +7,27 @@ from typing import Literal, Optional
 from enum import Enum
 
 
+class ScoringStyle(str, Enum):
+    """
+    여행자 평가 성향 유형
+    
+    BALANCED    : 가중 평균 (기존 방식) — 전반적으로 무난한 여행 선호
+    THRESHOLD   : 하한 기준형 — 최악의 요소 하나가 전체를 결정
+                  "숙박이 별로면 여행 전체가 망함"
+    PEAK        : 하이라이트형 — 하나의 극강 경험이 있으면 나머지는 감내
+                  "죽기 전에 꼭 먹어볼 레스토랑이 있으면 OK"
+    RISK_AVERSE : 리스크 회피형 — 검증된 곳만, 평점 낮은 곳은 강하게 거부
+                  "후기 없는 식당은 절대 안 감"
+    BUDGET_SAFE : 예산 최우선형 — 예산 초과 항목이 하나라도 있으면 전체 거부
+                  "계획한 예산 넘으면 스트레스"
+    """
+    BALANCED    = "balanced"
+    THRESHOLD   = "threshold"
+    PEAK        = "peak"
+    RISK_AVERSE = "risk_averse"
+    BUDGET_SAFE = "budget_safe"
+
+
 class PlaceCategory(str, Enum):
     ATTRACTION = "attraction"
     RESTAURANT = "restaurant"
@@ -69,6 +90,8 @@ class HotelFeatures(BaseFeatures):
     has_pool: bool = False
     family_friendly: bool = False
     late_checkin: bool = False
+    booking_url: str = ""           # Booking.com 딥링크
+    booking_url: str = ""
 
 
 # ──────────────────────────────────────────────
@@ -137,6 +160,7 @@ class TravelerPreferences:
     nightlife: int = 3
     shopping: int = 3
     walking_aversion: int = 3   # 높을수록 도보 이동 싫어함
+    scoring_style: str = ScoringStyle.BALANCED  # 여행자 평가 성향
 
 
 @dataclass

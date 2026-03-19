@@ -178,6 +178,54 @@ def _extract_json_from_text(text: str) -> str:
     return text[start:]
 
 
+def _get_transit_score(lat: float, lng: float) -> tuple[float, str]:
+    """
+    카카오 카테고리 검색으로 지하철 접근성 점수 계산.
+    반경 1km 내 가장 가까운 지하철역 거리 기반.
+    Returns: (score 1~5, 설명 문자열)
+    """
+    kakao_key = os.environ.get("KAKAO_API_KEY", "")
+    if not kakao_key or lat == 0.0 or lng == 0.0:
+        return 3.0, "측정 불가"
+    try:
+        url = "https://dapi.kakao.com/v2/local/search/category.json"
+        params = {
+            "category_group_code": "SW8",  # 지하철역
+            "x": lng,
+            "y": lat,
+            "radius": 1000,
+            "sort": "distance",
+            "size": 5,
+        }
+        headers = {"Authorization": f"KakaoAK {kakao_key}"}
+        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp.raise_for_status()
+        stations = resp.json().get("documents", [])
+
+        if not stations:
+            return 1.0, "반경 1km 내 지하철 없음"
+
+        nearest = int(stations[0].get("distance", 9999))
+        nearest_name = stations[0].get("place_name", "")
+        count = len(stations)
+
+        if nearest <= 200:
+            score = 5.0
+        elif nearest <= 400:
+            score = 4.0
+        elif nearest <= 700:
+            score = 3.0
+        elif nearest <= 1000:
+            score = 2.0
+        else:
+            score = 1.0
+
+        desc = f"{nearest_name} {nearest}m"
+        return score, desc
+    except Exception as e:
+        return 3.0, f"조회 실패: {e}"
+
+
 def _geocode_kakao(place_name: str, destination: str) -> tuple | None:
     """카카오맵 로컬 검색 API — 한국 장소/식당에 최적화"""
     kakao_key = os.environ.get("KAKAO_API_KEY", "")

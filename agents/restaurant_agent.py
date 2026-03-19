@@ -232,6 +232,12 @@ class RestaurantBrowsingAgent:
             self._log(f"  [WARN] Feature build failed: {e}")
             return None
 
+        # 카카오로 교통 접근성 실측값으로 덮어씌우기
+        from utils.feature_extractor import _get_transit_score
+        transit_score, transit_desc = _get_transit_score(lat, lng)
+        features.transit_access = transit_score
+        self._log(f"  [교통] {transit_desc} → {transit_score}/5")
+
         score, breakdown = score_restaurant(features, self.trip.preferences)
 
         node = PlaceNode(
