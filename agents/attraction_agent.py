@@ -18,7 +18,7 @@ from models.schemas import (
     TripInput, PlaceNode, PlaceCategory,
     AttractionFeatures,
 )
-from utils.web_collector import build_queries, search_places, collect_raw_text
+from utils.web_collector import build_queries, search_places, search_places_en, collect_raw_text, collect_candidate_texts
 from utils.feature_extractor import extract_features
 from utils.scorer import score_attraction
 
@@ -44,20 +44,21 @@ def extract_place_names(
     블로그 제목, 작성자명, 광고 등은 제외.
     """
     prompt = f"""
-다음은 {destination} 여행 관련 웹페이지 본문입니다.
+다음은 {destination} 여행 관련 웹페이지 본문입니다. 한국어 또는 영어로 작성되어 있을 수 있습니다.
 
 [본문]
 {raw_text[:3000]}
 
-위 본문에서 실제로 방문할 수 있는 구체적인 장소명만 추출하세요.
-- 포함: 관광지, 공원, 사원, 궁궐, 전망대, 박물관, 테마파크, 거리/골목 이름
-- 제외: 블로그 제목, 작성자명, "서울 여행", "추천 코스" 같은 일반 표현, 음식점, 숙소
+실제로 방문할 수 있는 관광지/명소 이름만 JSON 배열로 추출하세요.
+- 포함: 관광지, 공원, 궁궐, 전망대, 박물관, 테마파크, 거리/골목 이름 (한국어·영어 모두)
+- 제외: 블로그 제목, "서울 여행", "추천 코스" 같은 일반 표현, 음식점, 숙소
+- 영어 이름도 그대로 추출 (예: "Gyeongbokgung Palace", "N Seoul Tower")
+- 한국어+영어 혼용도 추출 (예: "경복궁", "Bukchon Hanok Village")
 
-반드시 JSON 배열로만 응답하세요 (다른 텍스트 없이):
-["장소명1", "장소명2", ...]
+JSON 배열만 응답 (다른 텍스트 없이):
+["이름1", "이름2", ...]
 
-추출할 수 없으면 빈 배열 []로 응답.
-최대 {max_places}개까지만.
+추출 불가면 []. 최대 {max_places}개.
 """
     try:
         resp = client.messages.create(
@@ -69,7 +70,7 @@ def extract_place_names(
         raw = raw.replace("```json", "").replace("```", "").strip()
         names = json.loads(raw)
         # 너무 긴 문자열(블로그 제목 등) 필터링
-        names = [n for n in names if isinstance(n, str) and 1 < len(n) < 20]
+        names = [n for n in names if isinstance(n, str) and 1 < len(n) < 50]
         return names
     except Exception as e:
         print(f"  [WARN] 장소명 추출 실패: {e}")
@@ -106,37 +107,59 @@ class AttractionBrowsingAgent:
         self._log(f"Step 1: 장소명 수집 — {self.trip.destination}")
         dest = self.trip.destination
 
-        queries = build_queries(
-            dest, "attraction",
-            self.trip.age_group,
-            self.trip.preferences.__dict__,
-        )
+        age = self.trip.age_group
+        age_str = {"20s":"20대","30s":"30대","40s":"40대",
+                   "50s":"50대","60s":"60대"}.get(age,"")
+        prefs = self.trip.preferences.__dict__
+
+        # 한국어 + 영어 쿼리 병행
+        queries_base = build_queries(dest, "attraction", age, prefs)
+        extra_ko = [
+            f"{dest} 대표 관광지 여행지 추천",
+            f"{dest} 꼭 가야 할 명소 베스트",
+            f"{dest} 유명한 곳 여행 코스",
+            f"{dest} 관광지 {age_str} 추천",
+        ]
+        queries_ko = queries_base
+        queries_en_raw = [
+            f"top tourist attractions {dest} must visit",
+            f"best places {dest} travel guide",
+            f"things to do {dest} visitors",
+            f"{dest} sightseeing famous places",
+        ]
 
         all_place_names: list[str] = []
+        seen: set[str] = set()
 
-        for query in queries[:3]:
-            self._log(f"  검색: {query}")
-            results = search_places(query, num=5)
+        def _add_names(names: list[str]):
+            for name in names:
+                if name not in seen:
+                    seen.add(name)
+                    all_place_names.append(name)
 
-            for r in results[:4]:
-                # snippet + title 합쳐서 장소명 추출
-                combined_text = f"{r.title}\n{r.snippet}"
-                names = extract_place_names(combined_text, dest)
-                if names:
-                    self._log(f"    → {names}")
-                    all_place_names.extend(names)
-                time.sleep(self.delay)
+        # 한국어 기본 쿼리 (build_queries 결과)
+        for query in queries_base:
+            self._log(f"  [KO] {query}")
+            texts = collect_candidate_texts(query, num_results=5, gl="kr", hl="ko", delay=self.delay)
+            for text in texts:
+                _add_names(extract_place_names(text, dest))
 
-        # 중복 제거 + 최대 개수 제한
-        seen = set()
-        unique_names = []
-        for name in all_place_names:
-            if name not in seen:
-                seen.add(name)
-                unique_names.append(name)
+        # 한국어 추가 쿼리 (extra_ko)
+        for query in extra_ko:
+            self._log(f"  [KO+] {query}")
+            texts = collect_candidate_texts(query, num_results=5, gl="kr", hl="ko", delay=self.delay)
+            for text in texts:
+                _add_names(extract_place_names(text, dest))
 
-        self._log(f"  → 총 {len(unique_names)}개 장소명 추출: {unique_names[:8]}...")
-        return unique_names[:self.max_places]
+        # 영어 쿼리
+        for query in queries_en_raw:
+            self._log(f"  [EN] {query}")
+            texts = collect_candidate_texts(query, num_results=5, gl="us", hl="en", delay=self.delay)
+            for text in texts:
+                _add_names(extract_place_names(text, dest))
+
+        self._log(f"  → 총 {len(all_place_names)}개 장소명 추출: {all_place_names[:8]}...")
+        return all_place_names  # Step2에서 max_places개 채워지면 자동 중단
 
     # ── Step 2–4: 단일 장소 처리 ──
     def _process_place(self, place_name: str) -> PlaceNode | None:

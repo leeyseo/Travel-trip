@@ -21,7 +21,7 @@ from models.schemas import (
     TripInput, PlaceNode, PlaceCategory,
     HotelFeatures,
 )
-from utils.web_collector import search_places, collect_raw_text
+from utils.web_collector import search_places, search_places_en, collect_raw_text, collect_candidate_texts, collect_candidate_texts
 from utils.feature_extractor import extract_features, DEFAULT_COORDS, COORD_BOUNDS
 from utils.scorer import score_hotel
 
@@ -191,20 +191,21 @@ def make_booking_url(
 # ──────────────────────────────────────────────
 def extract_hotel_names(raw_text: str, destination: str, max_hotels: int = 15) -> list[str]:
     prompt = f"""
-다음은 {destination} 숙소 관련 웹페이지 본문입니다.
+다음은 {destination} 숙소 관련 웹페이지 본문입니다. 한국어 또는 영어로 작성되어 있을 수 있습니다.
 
 [본문]
 {raw_text[:3000]}
 
-위 본문에서 실제 호텔/게스트하우스/펜션 이름만 추출하세요.
-- 포함: 호텔명, 게스트하우스명, 펜션명, 리조트명
+실제 숙소 이름만 JSON 배열로 추출하세요.
+- 포함: 호텔명, 게스트하우스명, 펜션명, 리조트명, 한옥 숙소명 (한국어·영어 모두)
 - 제외: 지역명, 블로그 제목, "추천", "베스트" 같은 일반 표현
+- 영어 이름도 그대로 추출 (예: "Park Hyatt Seoul", "Signiel Seoul")
+- 한국어+영어 혼용도 추출 (예: "파크 하얏트 서울", "L7 Hongdae")
 
-반드시 JSON 배열로만 응답 (다른 텍스트 없이):
-["호텔명1", "호텔명2", ...]
+JSON 배열만 응답 (다른 텍스트 없이):
+["이름1", "이름2", ...]
 
-추출 불가시 빈 배열 [].
-최대 {max_hotels}개.
+추출 불가면 []. 최대 {max_hotels}개.
 """
     try:
         resp = client.messages.create(
@@ -217,7 +218,7 @@ def extract_hotel_names(raw_text: str, destination: str, max_hotels: int = 15) -
         start, end = raw.find("["), raw.rfind("]")
         if start != -1 and end != -1:
             names = json.loads(raw[start:end+1])
-            return [n for n in names if isinstance(n, str) and 1 < len(n) < 30]
+            return [n for n in names if isinstance(n, str) and 1 < len(n) < 50]
     except Exception as e:
         print(f"  [WARN] 호텔명 추출 실패: {e}")
     return []
@@ -245,25 +246,52 @@ class HotelBrowsingAgent:
         age = {"20s":"20대","30s":"30대","40s":"40대","family":"가족"}.get(self.trip.age_group, "")
         budget = self.trip.budget_krw // self.trip.duration_days // self.trip.traveler_count
 
-        queries = [
+        queries_ko = [
             f"{dest} 호텔 추천 {age} 2024",
             f"{dest} 숙소 한국인 후기 가성비",
             f"{dest} 호텔 베스트 위치 좋은",
+            f"{dest} 럭셔리 호텔 5성급 추천",
+            f"{dest} 부티크 호텔 감성 숙소 추천",
+            f"{dest} 호텔 교통 좋은 지하철역 근처",
+        ]
+        queries_en = [
+            f"best hotels {dest} 2024 travel guide",
+            f"best boutique hotels {dest} unique stays",
+            f"luxury hotels {dest} top rated",
+            f"best value hotels {dest} tripadvisor",
+            f"where to stay {dest} neighborhood guide",
         ]
 
         exclude_patterns = ["추천", "베스트", "top", "best", "리스트", "숙소", "호텔가"]
         all_names: list[str] = []
+        seen: set[str] = set()
 
-        for query in queries:
-            self._log(f"  검색: {query}")
-            results = search_places(query, num=5)
-            for r in results[:4]:
-                combined = f"{r.title}\n{r.snippet}"
-                names = extract_hotel_names(combined, dest)
-                if names:
-                    self._log(f"    → {names}")
-                    all_names.extend(names)
-                time.sleep(self.delay)
+        # 한국어 쿼리 — 실제 페이지 크롤링
+        for query in queries_ko:
+            self._log(f"  [KO] {query}")
+            texts = collect_candidate_texts(query, num_results=5, gl="kr", hl="ko", delay=self.delay)
+            for text in texts:
+                names = extract_hotel_names(text, dest)
+                for name in names:
+                    if name not in seen:
+                        seen.add(name)
+                        all_names.append(name)
+                        self._log(f"    + {name}")
+
+        # 영어 쿼리 — 실제 페이지 크롤링
+        for query in queries_en:
+            self._log(f"  [EN] {query}")
+            try:
+                texts = collect_candidate_texts(query, num_results=5, gl="us", hl="en", delay=self.delay)
+                for text in texts:
+                    names = extract_hotel_names(text, dest)
+                    for name in names:
+                        if name not in seen:
+                            seen.add(name)
+                            all_names.append(name)
+                            self._log(f"    + {name}")
+            except Exception:
+                continue
 
         seen, unique = set(), []
         for name in all_names:
@@ -277,7 +305,7 @@ class HotelBrowsingAgent:
             unique.append(name)
 
         self._log(f"  → 총 {len(unique)}개 숙소명: {unique[:5]}...")
-        return unique[:self.max_places]
+        return unique  # Step2에서 max_places 달성 시 자동 중단
 
     def _process_place(self, hotel_name: str) -> PlaceNode | None:
         dest = self.trip.destination
@@ -392,6 +420,9 @@ class HotelBrowsingAgent:
         self._log(f"\nStep 2: 숙소별 피처 추출 ({len(candidates)}개)")
         nodes = []
         for name in candidates:
+            if len(nodes) >= self.max_places:
+                self._log(f"  목표 {self.max_places}개 달성, 중단")
+                break
             node = self._process_place(name)
             if node:
                 nodes.append(node)

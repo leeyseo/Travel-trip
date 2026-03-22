@@ -1,614 +1,546 @@
 """
-플래닝 에이전트 — 관광지/맛집/숙소 그래프 → 최적 여행 일정 생성
+플래닝 에이전트 v6
 
-핵심 로직:
-  1. 관광지 노드를 지리적 클러스터로 묶기
-  2. 클러스터 순서로 날짜 배정
-  3. 각 날짜 클러스터 중심에서 가장 가까운 숙소 배정
-  4. 클러스터별 맛집 배정 (점심/저녁)
-  5. Claude로 일정 설명 생성
+v5 → v6 변경사항:
+- LLM 호출 완전 제거 (순수 룰 기반)
+- 클러스터별 랜드마크 필수 포함 (CLUSTER_LANDMARKS)
+- 동선 기반 맛집 선택 (prev→식당→next detour 최소화)
+- 시간 기반 타임라인 (관광지 소요시간 반영, 카페 14:30~17:30 자동 삽입)
 """
 
 import json
 import math
-import os
 from dataclasses import dataclass, field
 from typing import Optional
-import anthropic
+from collections import defaultdict
 
-client = anthropic.Anthropic()
+
+# ──────────────────────────────────────────────
+# 클러스터 정의 (14개)
+# ──────────────────────────────────────────────
+CLUSTER_BOUNDS = {
+    "홍대/마포":     {"lat": (37.53, 37.58), "lng": (126.88, 126.95)},
+    "신촌/연남":     {"lat": (37.54, 37.61), "lng": (126.92, 126.96)},
+    "종로/광화문":   {"lat": (37.55, 37.60), "lng": (126.95, 127.00)},
+    "강북/북촌":     {"lat": (37.57, 37.66), "lng": (126.97, 127.02)},
+    "용산/서울역":   {"lat": (37.51, 37.57), "lng": (126.95, 126.99)},
+    "명동/중구":     {"lat": (37.54, 37.58), "lng": (126.97, 127.01)},
+    "이태원/한남":   {"lat": (37.52, 37.56), "lng": (126.97, 127.02)},
+    "성수/왕십리":   {"lat": (37.53, 37.58), "lng": (127.02, 127.08)},
+    "동대문/회기":   {"lat": (37.57, 37.63), "lng": (127.02, 127.08)},
+    "강남/서초":     {"lat": (37.44, 37.54), "lng": (126.99, 127.07)},
+    "잠실/송파":     {"lat": (37.48, 37.53), "lng": (127.07, 127.13)},
+    "여의도/영등포": {"lat": (37.47, 37.55), "lng": (126.88, 126.95)},
+    "강서/마곡":     {"lat": (37.48, 37.60), "lng": (126.80, 126.88)},
+    "강동/천호":     {"lat": (37.53, 37.57), "lng": (127.09, 127.18)},
+}
+
+CLUSTER_CENTERS = {
+    "홍대/마포":     (37.555, 126.922),
+    "신촌/연남":     (37.565, 126.935),
+    "종로/광화문":   (37.575, 126.978),
+    "강북/북촌":     (37.590, 126.985),
+    "용산/서울역":   (37.540, 126.970),
+    "명동/중구":     (37.560, 126.983),
+    "이태원/한남":   (37.540, 126.993),
+    "성수/왕십리":   (37.550, 127.050),
+    "동대문/회기":   (37.595, 127.050),
+    "강남/서초":     (37.503, 127.030),
+    "잠실/송파":     (37.511, 127.100),
+    "여의도/영등포": (37.523, 126.918),
+    "강서/마곡":     (37.554, 126.845),
+    "강동/천호":     (37.545, 127.145),
+}
+
+CLUSTER_CONCEPTS = {
+    "홍대/마포":     "힙한 거리·클럽·인디 문화·쇼핑",
+    "신촌/연남":     "감성 카페·연트럴파크·브런치",
+    "종로/광화문":   "역사·궁궐·전통시장·한옥",
+    "강북/북촌":     "북촌한옥·삼청동·낙산공원",
+    "용산/서울역":   "전쟁기념관·서울로7017·남대문",
+    "명동/중구":     "쇼핑·화장품·길거리음식·남산",
+    "이태원/한남":   "다국적 음식·바·이색 문화",
+    "성수/왕십리":   "힙한 카페·공방·뚝섬한강",
+    "동대문/회기":   "동대문시장·경희대·경춘선숲길",
+    "강남/서초":     "코엑스·한강공원·도시 쇼핑",
+    "잠실/송파":     "롯데월드·석촌호수·올림픽공원",
+    "여의도/영등포": "한강 뷰·IFC몰·벚꽃길",
+    "강서/마곡":     "서울식물원·마곡나루",
+    "강동/천호":     "암사동유적·고덕천",
+}
+
+# 클러스터별 랜드마크 — 반드시 일정에 포함 (한글+영문 모두 포함)
+CLUSTER_LANDMARKS = {
+    "홍대/마포":     ["홍대 걷고 싶은 거리", "Hongdae", "홍대"],
+    "신촌/연남":     ["연남동", "연트럴파크", "Yeonnam"],
+    "종로/광화문":   ["경복궁", "Gyeongbokgung", "광화문광장", "Cheonggyecheon", "청계천"],
+    "강북/북촌":     ["북촌 한옥마을", "Bukchon", "낙산공원", "Naksan"],
+    "용산/서울역":   ["국립중앙박물관", "National Museum", "전쟁기념관", "서울로7017"],
+    "명동/중구":     ["덕수궁", "Deoksugung", "남산타워", "N Seoul Tower", "Namsan", "명동"],
+    "이태원/한남":   ["이태원", "Itaewon", "해방촌", "경리단길"],
+    "성수/왕십리":   ["Seongsu", "성수", "카페 어니언"],
+    "동대문/회기":   ["동대문", "Dongdaemun", "경춘선숲길"],
+    "강남/서초":     ["코엑스", "COEX", "반포한강공원", "Banpo", "강남"],
+    "잠실/송파":     ["롯데월드", "Lotte World", "석촌호수", "올림픽공원"],
+    "여의도/영등포": ["여의도한강공원", "63빌딩", "63 SQUARE", "IFC"],
+    "강서/마곡":     ["서울식물원", "Seoul Botanic"],
+    "강동/천호":     ["암사동유적", "Amsa"],
+}
+
+MAX_FALLBACK_KM = 5.0
+
+
+# ──────────────────────────────────────────────
+# 유틸
+# ──────────────────────────────────────────────
+def _haversine(lat1, lng1, lat2, lng2):
+    R = 6371
+    a = math.sin(math.radians(lat2 - lat1) / 2) ** 2 + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(math.radians(lng2 - lng1) / 2) ** 2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def _assign_cluster(lat, lng):
+    matched = []
+    for name, b in CLUSTER_BOUNDS.items():
+        if b["lat"][0] <= lat <= b["lat"][1] and b["lng"][0] <= lng <= b["lng"][1]:
+            matched.append((name, _haversine(lat, lng, *CLUSTER_CENTERS[name])))
+    if matched:
+        return min(matched, key=lambda x: x[1])[0]
+    nn, nc = min(CLUSTER_CENTERS.items(), key=lambda x: _haversine(lat, lng, x[1][0], x[1][1]))
+    return nn if _haversine(lat, lng, *nc) <= MAX_FALLBACK_KM else "기타"
+
+
+def _get_cluster(node):
+    stored = node.get("cluster", "")
+    if stored and stored != "기타" and stored in CLUSTER_CENTERS:
+        return stored
+    return _assign_cluster(node["lat"], node["lng"])
 
 
 # ──────────────────────────────────────────────
 # 데이터 구조
 # ──────────────────────────────────────────────
 @dataclass
+class ScheduleItem:
+    time: str
+    type: str
+    meal_type: str
+    node: dict
+    duration_hr: float
+
+@dataclass
 class DayPlan:
     day: int
     date: str
     hotel: dict
-    morning: list[dict] = field(default_factory=list)    # 관광지
-    lunch: Optional[dict] = None                          # 맛집
-    afternoon: list[dict] = field(default_factory=list)  # 관광지
-    dinner: Optional[dict] = None                         # 맛집
+    cluster_name: str = ""
+    schedule: list = field(default_factory=list)
     notes: str = ""
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
+        morning, afternoon, breakfast, lunch, dinner, cafes = [], [], None, None, None, []
+        for item in self.schedule:
+            if item.type == "meal":
+                if item.meal_type == "breakfast": breakfast = item.node
+                elif item.meal_type == "lunch": lunch = item.node
+                elif item.meal_type == "dinner": dinner = item.node
+            elif item.type == "cafe":
+                cafes.append(item.node)
+            elif item.type == "attraction":
+                (morning if int(item.time.split(":")[0]) < 14 else afternoon).append(item.node)
         return {
-            "day": self.day,
-            "date": self.date,
-            "hotel": {
-                "name": self.hotel["name"],
-                "price_per_night": self.hotel["features"]["price_per_night"],
-                "transit": self.hotel["features"]["transit_access"],
-                "booking_url": self.hotel["features"].get("booking_url", ""),
-                "lat": self.hotel["lat"],
-                "lng": self.hotel["lng"],
-            },
-            "morning": [_slim(a) for a in self.morning],
-            "lunch": _slim(self.lunch) if self.lunch else None,
-            "afternoon": [_slim(a) for a in self.afternoon],
-            "dinner": _slim(self.dinner) if self.dinner else None,
+            "day": self.day, "date": self.date, "cluster": self.cluster_name,
+            "hotel": {"name": self.hotel["name"],
+                      "price_per_night": self.hotel["features"]["price_per_night"],
+                      "transit": self.hotel["features"]["transit_access"],
+                      "booking_url": self.hotel["features"].get("booking_url", ""),
+                      "lat": self.hotel["lat"], "lng": self.hotel["lng"]},
+            "morning": [_slim(a) for a in morning],
+            "afternoon": [_slim(a) for a in afternoon],
+            "breakfast": _slim(breakfast) if breakfast else None,
+            "lunch": _slim(lunch) if lunch else None,
+            "dinner": _slim(dinner) if dinner else None,
+            "cafes": [_slim(c) for c in cafes],
+            "timeline": [{"time": s.time, "type": s.type, "meal_type": s.meal_type, **_slim(s.node)} for s in self.schedule],
             "notes": self.notes,
         }
 
-
-def _slim(node: dict) -> dict:
-    """노드에서 필요한 정보만 추출"""
-    if not node:
-        return {}
+def _slim(node):
+    if not node: return {}
     f = node.get("features", {})
-    return {
-        "name": node["name"],
-        "score": node["node_score"],
-        "lat": node["lat"],
-        "lng": node["lng"],
-        "category": f.get("category") or f.get("cuisine_type", ""),
-        "duration_hr": f.get("avg_duration_hr") or 1.5,
-        "price": f.get("entry_fee_krw") or f.get("avg_price_per_person") or 0,
-    }
+    return {"name": node["name"], "score": node["node_score"],
+            "lat": node["lat"], "lng": node["lng"],
+            "category": f.get("category") or f.get("cuisine_type", ""),
+            "duration_hr": f.get("avg_duration_hr") or 1.5,
+            "price": f.get("entry_fee_krw") or f.get("avg_price_per_person") or 0}
 
 
 # ──────────────────────────────────────────────
-# 유틸 함수
+# 관광지 필터 + 랜드마크 필수 포함
 # ──────────────────────────────────────────────
-def _haversine(lat1, lng1, lat2, lng2) -> float:
-    R = 6371
-    d_lat = math.radians(lat2 - lat1)
-    d_lng = math.radians(lng2 - lng1)
-    a = math.sin(d_lat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lng/2)**2
-    return R * 2 * math.asin(math.sqrt(a))
+SEOUL_LAT, SEOUL_LNG = (37.4, 37.7), (126.7, 127.2)
+BAD_NAMES = {"Sokcho", "Gangneung", "속초", "강릉"}
+
+def _is_valid(n):
+    lat, lng = n.get("lat", 0), n.get("lng", 0)
+    dur = n.get("features", {}).get("avg_duration_hr", 0) or 0
+    return (dur <= 8 and n.get("name") not in BAD_NAMES
+            and SEOUL_LAT[0] <= lat <= SEOUL_LAT[1]
+            and SEOUL_LNG[0] <= lng <= SEOUL_LNG[1])
+
+def _select_attractions(cluster_name, candidates, n=4):
+    """랜드마크 우선 포함 → score 순 채움"""
+    landmarks = CLUSTER_LANDMARKS.get(cluster_name, [])
+    must, rest = [], []
+    for att in candidates:
+        is_lm = any(lm.lower() in att["name"].lower() or att["name"].lower() in lm.lower()
+                     for lm in landmarks)
+        (must if is_lm and len(must) < n else rest).append(att)
+    rest.sort(key=lambda x: x["node_score"], reverse=True)
+    return (must + rest)[:n]
 
 
-def _centroid(nodes: list[dict]) -> tuple[float, float]:
-    lats = [n["lat"] for n in nodes]
-    lngs = [n["lng"] for n in nodes]
-    return sum(lats)/len(lats), sum(lngs)/len(lngs)
+# ──────────────────────────────────────────────
+# 클러스터 계획
+# ──────────────────────────────────────────────
+def _plan_clusters(attractions, restaurants, hotel, n_days, preferences, variant_idx=0):
+    wa = preferences.get("walking_aversion", 3)
+    h_lat = hotel.get("lat", 37.5665) if hotel else 37.5665
+    h_lng = hotel.get("lng", 126.978) if hotel else 126.978
+    ca, cr = defaultdict(list), defaultdict(list)
+    for n in attractions: ca[_get_cluster(n)].append(n)
+    for r in restaurants: cr[_get_cluster(r)].append(r)
+    ca.pop("기타", None); cr.pop("기타", None)
+    valid = [c for c in ca if len(ca[c]) >= 2]
 
+    def _score(name):
+        att, rest, cen = ca.get(name, []), cr.get(name, []), CLUSTER_CENTERS.get(name)
+        if not cen: return 0.0
+        return ((sum(n["node_score"] for n in att) / len(att) if att else 0) * 0.35
+                + (sum(r["node_score"] for r in rest) / len(rest) if rest else 0) * 0.15
+                + min(len(att) / 3.0, 1.0) * 0.25 + min(len(rest) / 3.0, 1.0) * 0.15
+                - _haversine(h_lat, h_lng, cen[0], cen[1]) / max(20 - wa * 1.5, 5) * 0.1)
 
-def _cluster_by_day(
-    attractions: list[dict],
-    n_days: int,
-    hotel_loc: dict = None,
-    walking_aversion: int = 3,
-) -> list[list[dict]]:
-    """
-    관광지를 n_days개의 클러스터로 나누기.
-    - 숙소 위치가 있으면 숙소에서 가까운 노드 우선 배정
-    - 클러스터 내 최대 거리 8km 제한
-    - 산/자연은 하루 1개 제한
-    """
-    if not attractions:
-        return [[] for _ in range(n_days)]
+    scored = sorted(valid, key=_score, reverse=True)
+    if len(scored) < n_days:
+        scored += sorted([c for c in ca if c not in scored], key=_score, reverse=True)
 
-    sorted_nodes = sorted(attractions, key=lambda x: x["node_score"], reverse=True)
-
-    max_cluster_km = 6 + (5 - walking_aversion) * 3  # wa=4→9km, wa=3→12km, wa=1→18km
-
-    # seed 선택: 서로 max_cluster_km*1.5 이상 떨어진 노드를 n_days개 선택
-    # (max_cluster_km 간격은 너무 좁아서 같은 생활권이 여러 seed로 잡힘)
-    seed_min_gap = max_cluster_km * 1.5
-    seeds = [sorted_nodes[0]]
-    for node in sorted_nodes[1:]:
-        if len(seeds) >= n_days:
-            break
-        if all(_haversine(node["lat"], node["lng"], s["lat"], s["lng"]) >= seed_min_gap for s in seeds):
-            seeds.append(node)
-
-    # seed 부족 시 간격 완화하며 재시도
-    if len(seeds) < n_days:
-        for gap in [max_cluster_km, max_cluster_km * 0.5]:
-            for node in sorted_nodes:
-                if node in seeds:
-                    continue
-                if all(_haversine(node["lat"], node["lng"], s["lat"], s["lng"]) >= gap for s in seeds):
-                    seeds.append(node)
-                if len(seeds) >= n_days:
-                    break
-            if len(seeds) >= n_days:
-                break
-
-    clusters = [[s] for s in seeds[:n_days]]
-    remaining = [n for n in sorted_nodes if n not in seeds[:n_days]]
-
-    HEAVY_CATEGORIES = {"자연", "등산"}
-
-    def _is_heavy(node: dict) -> bool:
-        cat = node.get("features", {}).get("category", "")
-        name = node.get("name", "")
-        return cat in HEAVY_CATEGORIES or any(k in name for k in ["산", "등산", "트레킹"])
-
-    for node in remaining:
-        best_cluster = -1
-        best_score = float("-inf")
-        node_is_heavy = _is_heavy(node)
-
-        for i, cluster in enumerate(clusters):
-            if len(cluster) >= 4:
-                continue
-            c_lat, c_lng = _centroid(cluster)
-            dist_to_center = _haversine(node["lat"], node["lng"], c_lat, c_lng)
-
-            # centroid 기준 거리 체크 — 새 노드가 클러스터 중심에서 max_cluster_km 초과 시 제외
-            # (기존 max_inner_dist 방식은 클러스터가 한쪽으로 쏠릴 경우 원거리 노드를 걸러내지 못함)
-            if dist_to_center > max_cluster_km:
-                continue
-
-            heavy_in_cluster = sum(1 for m in cluster if _is_heavy(m))
-            if node_is_heavy and heavy_in_cluster >= 1:
-                continue
-
-            # 거리 페널티: walking_aversion 높을수록 거리에 더 민감
-            dist_sensitivity = 10 + walking_aversion * 2  # 3→16, 5→20, 1→12
-            penalty = dist_to_center / dist_sensitivity
-
-            # 숙소에서 클러스터까지 거리 페널티 (walking_aversion 높을수록 강화)
-            if hotel_loc:
-                hotel_to_cluster = _haversine(
-                    hotel_loc["lat"], hotel_loc["lng"], c_lat, c_lng
-                )
-                hotel_sensitivity = 20 + walking_aversion * 5  # 3→35, 5→45, 1→25
-                penalty += hotel_to_cluster / hotel_sensitivity
-
-            score = node["node_score"] - penalty
-            if score > best_score:
-                best_score = score
-                best_cluster = i
-
-        if best_cluster == -1:
-            # 모든 클러스터가 거리 초과 → centroid 기준 가장 가까운 클러스터에 배정
-            best_cluster = min(
-                range(len(clusters)),
-                key=lambda i: _haversine(
-                    node["lat"], node["lng"],
-                    *_centroid(clusters[i])
-                )
-            )
-        clusters[best_cluster].append(node)
-
-    # ── 클러스터 최소 관광지 보장 ──────────────────────────────
-    # 1개짜리 클러스터가 있으면 다른 클러스터(4개 초과분)에서 가장 가까운 노드를 이동
-    # walking_aversion >= 4면 최소 2개, 그 이상은 최소 2개로 통일
-    for _ in range(3):  # 최대 3회 반복 (다중 thin 클러스터 대응)
-        thin_clusters = [i for i, c in enumerate(clusters) if len(c) < 2]
-        if not thin_clusters:
-            break
-        for ci in thin_clusters:
-            c_lat, c_lng = _centroid(clusters[ci])
-            best_node = None
-            best_score = float("-inf")
-            best_src = -1
-
-            # 다른 클러스터에서 2개 이상인 경우에만 노드를 빌려옴
-            for src_i, src_cluster in enumerate(clusters):
-                if src_i == ci or len(src_cluster) < 2:
-                    continue
-                for node in src_cluster:
-                    dist = _haversine(node["lat"], node["lng"], c_lat, c_lng)
-                    # 이동 후 src 클러스터 centroid 변화 최소화를 위해 score에서 dist 페널티
-                    score = node["node_score"] - dist / (max_cluster_km * 3)
-                    if score > best_score:
-                        best_score = score
-                        best_node = node
-                        best_src = src_i
-
-            if best_node and best_src >= 0:
-                clusters[best_src].remove(best_node)
-                clusters[ci].append(best_node)
-
-    return [c[:4] for c in clusters]
-
-
-def _optimize_route(nodes: list[dict], hotel: dict = None) -> list[dict]:
-    """
-    관광지 순서 최적화 (Nearest Neighbor)
-    숙소 위치가 있으면 숙소에서 가장 가까운 노드부터 시작
-    """
-    if len(nodes) <= 1:
-        return nodes
-
-    # 시작점: 숙소에서 가장 가까운 관광지
-    if hotel and hotel.get("lat") and hotel.get("lng"):
-        start = min(
-            nodes,
-            key=lambda n: _haversine(hotel["lat"], hotel["lng"], n["lat"], n["lng"])
-        )
+    if variant_idx == 0: selected = scored[:n_days]
+    elif variant_idx == 1:
+        selected = scored[::2][:n_days]
+        if len(selected) < n_days: selected += [c for c in scored if c not in selected][:n_days - len(selected)]
     else:
-        start = nodes[0]  # 점수 최고 노드
+        selected = scored[1::2][:n_days]
+        if len(selected) < n_days: selected += [c for c in scored if c not in selected][:n_days - len(selected)]
 
-    remaining = [n for n in nodes if n is not start]
-    route = [start]
+    ordered, rem, cur = [], list(selected), (h_lat, h_lng)
+    while rem:
+        nn = min(rem, key=lambda c: _haversine(cur[0], cur[1], *CLUSTER_CENTERS.get(c, cur)))
+        ordered.append(nn); rem.remove(nn); cur = CLUSTER_CENTERS.get(nn, cur)
+    return ordered, dict(ca), dict(cr)
 
-    while remaining:
+
+# ──────────────────────────────────────────────
+# 숙소 / 동선 / 맛집
+# ──────────────────────────────────────────────
+def _pick_hotel(cur_cluster, next_cluster, hotels, used_names):
+    if not hotels: return {}
+    cur_c = CLUSTER_CENTERS.get(cur_cluster, (37.5665, 126.978))
+    next_c = CLUSTER_CENTERS.get(next_cluster, cur_c) if next_cluster else cur_c
+    t_lat, t_lng = cur_c[0] * 0.7 + next_c[0] * 0.3, cur_c[1] * 0.7 + next_c[1] * 0.3
+    for name in reversed(used_names):
+        h = next((x for x in hotels if x["name"] == name), None)
+        if h and _haversine(cur_c[0], cur_c[1], h["lat"], h["lng"]) <= 6.0: return h
+    return max(hotels, key=lambda h: h["node_score"] - _haversine(t_lat, t_lng, h["lat"], h["lng"]) / 30)
+
+def _optimize_route(nodes, hotel=None):
+    """Nearest Neighbor TSP — 숙소에서 출발, 모든 노드를 최단 경로로 순회."""
+    if len(nodes) <= 1: return nodes
+    start_lat = hotel["lat"] if hotel and hotel.get("lat") else nodes[0]["lat"]
+    start_lng = hotel["lng"] if hotel and hotel.get("lng") else nodes[0]["lng"]
+    # 숙소에서 가장 가까운 노드부터 시작
+    start = min(nodes, key=lambda n: _haversine(start_lat, start_lng, n["lat"], n["lng"]))
+    rem, route = [n for n in nodes if n is not start], [start]
+    while rem:
         last = route[-1]
-        nearest = min(
-            remaining,
-            key=lambda n: _haversine(last["lat"], last["lng"], n["lat"], n["lng"])
-        )
-        route.append(nearest)
-        remaining.remove(nearest)
-
+        nn = min(rem, key=lambda n: _haversine(last["lat"], last["lng"], n["lat"], n["lng"]))
+        route.append(nn); rem.remove(nn)
     return route
 
 
-def _best_restaurant_near(
-    prev_place: dict,
-    next_place: dict,
-    restaurants: list[dict],
-    used: set,
-    used_cuisines: list[str],
-) -> dict | None:
+def _optimize_route_full(all_stops, hotel):
     """
-    이전 장소 → 다음 장소 사이 동선에서 가장 자연스러운 맛집 선택.
-    이전 장소와 다음 장소의 중간 지점 기준으로 선택.
+    TSP 최적화 — 숙소 출발 → 모든 정류장(관광지+식사) 순회 → 숙소 복귀.
+    2-opt 개선으로 교차 경로 제거.
     """
-    if not restaurants:
-        return None
+    if len(all_stops) <= 2:
+        return _optimize_route(all_stops, hotel)
 
-    # 중간 지점 계산
-    if prev_place and next_place:
-        mid_lat = (prev_place["lat"] + next_place["lat"]) / 2
-        mid_lng = (prev_place["lng"] + next_place["lng"]) / 2
-    elif prev_place:
-        mid_lat, mid_lng = prev_place["lat"], prev_place["lng"]
-    elif next_place:
-        mid_lat, mid_lng = next_place["lat"], next_place["lng"]
-    else:
-        mid_lat, mid_lng = 37.5665, 126.978
+    h_lat = hotel.get("lat", 37.5665)
+    h_lng = hotel.get("lng", 126.978)
 
-    candidates = [r for r in restaurants if r["name"] not in used]
-    if not candidates:
-        candidates = list(restaurants)
+    # 1단계: Nearest Neighbor로 초기 경로
+    route = _optimize_route(all_stops, hotel)
 
+    # 2단계: 2-opt 개선 (교차 경로 풀기)
+    def total_dist(r):
+        d = _haversine(h_lat, h_lng, r[0]["lat"], r[0]["lng"])
+        for i in range(len(r) - 1):
+            d += _haversine(r[i]["lat"], r[i]["lng"], r[i+1]["lat"], r[i+1]["lng"])
+        d += _haversine(r[-1]["lat"], r[-1]["lng"], h_lat, h_lng)
+        return d
+
+    improved = True
+    while improved:
+        improved = False
+        best_dist = total_dist(route)
+        for i in range(len(route) - 1):
+            for j in range(i + 1, len(route)):
+                new_route = route[:i] + route[i:j+1][::-1] + route[j+1:]
+                new_dist = total_dist(new_route)
+                if new_dist < best_dist - 0.01:  # 10m 이상 개선 시
+                    route = new_route
+                    best_dist = new_dist
+                    improved = True
+                    break
+            if improved:
+                break
+
+    return route
+
+# 끼니별 cuisine 적합도
+MEAL_FITNESS = {
+    "breakfast": {
+        "good": ["브런치", "카페", "베이커리", "팬케이크", "수제비", "칼국수", "국수", "분식", "해장국", "삼계탕", "죽", "토스트", "샌드위치"],
+        "bad":  ["구이", "고기", "곱창", "막창", "양대창", "클럽", "펍", "칵테일", "와인바", "코스", "샤브", "족발", "보쌈"],
+    },
+    "lunch": {
+        "good": ["한식", "냉면", "칼국수", "국수", "비빔", "쌀국수", "라멘", "파스타", "딤섬", "중식", "이탈리안", "베트남", "멕시칸", "분식", "만두", "삼계탕", "감자탕"],
+        "bad":  ["클럽", "펍", "칵테일"],
+    },
+    "cafe": {
+        "good": ["카페", "디저트", "커피", "베이커리", "차", "티", "팬케이크", "브런치", "아이스크림"],
+        "bad":  ["구이", "고기", "곱창", "냉면", "해장국", "감자탕", "족발", "보쌈", "삼겹살"],
+    },
+    "dinner": {
+        "good": ["구이", "고기", "곱창", "양대창", "한우", "삼겹살", "소금구이", "코스", "와인", "이탈리안", "프렌치", "한정식", "해산물", "복어", "샤브", "족발", "보쌈", "통닭", "퓨전"],
+        "bad":  ["분식", "브런치", "팬케이크", "토스트"],
+    },
+}
+
+def _meal_fitness(cuisine: str, meal_type: str) -> float:
+    """끼니 타입에 맞는 cuisine이면 보너스, 안 맞으면 패널티."""
+    rules = MEAL_FITNESS.get(meal_type)
+    if not rules or not cuisine:
+        return 0.0
+    cl = cuisine.lower()
+    if any(g in cl for g in rules["good"]):
+        return 0.15
+    if any(b in cl for b in rules["bad"]):
+        return -0.25
+    return 0.0
+
+
+def _pick_meal(prev_stop, next_stop, pool, fallback, used, used_cuisines,
+               max_dist, price_range=(0, 999999), prefer_types=None, meal_type=""):
+    p_lat, p_lng = prev_stop["lat"], prev_stop["lng"]
+    n_lat, n_lng = next_stop.get("lat", p_lat), next_stop.get("lng", p_lng)
+    direct = _haversine(p_lat, p_lng, n_lat, n_lng)
     def score(r):
-        dist = _haversine(mid_lat, mid_lng, r["lat"], r["lng"])
-        dist_penalty = dist / 50
+        detour = (_haversine(p_lat, p_lng, r["lat"], r["lng"]) + _haversine(r["lat"], r["lng"], n_lat, n_lng)) - direct
         cuisine = r.get("features", {}).get("cuisine_type", "")
-        cuisine_penalty = 0.15 if cuisine and cuisine in (used_cuisines[-2:] if used_cuisines else []) else 0
-        return r["node_score"] - dist_penalty - cuisine_penalty
-
-    return max(candidates, key=score)
-
-
-def _best_hotel_for_cluster(
-    cluster: list[dict],
-    hotels: list[dict],
-    used_hotels: list[str],
-    walking_aversion: int = 3,
-) -> dict:
-    """클러스터 중심에서 가장 가까운 호텔 선택"""
-    if not cluster or not hotels:
-        return hotels[0] if hotels else {}
-
-    c_lat, c_lng = _centroid(cluster)  # 한 번만 계산, 재할당 없음
-
-    # 거리 페널티: walking_aversion 높을수록 거리에 민감
-    # wa=1→200, wa=3→100, wa=5→40 (낮을수록 거리 둔감)
-    dist_sensitivity = 200 - walking_aversion * 30
-
-    def hotel_score(h):
-        dist = _haversine(c_lat, c_lng, h["lat"], h["lng"])
-        dist_penalty = dist / dist_sensitivity
-        return h["node_score"] - dist_penalty
-
-    # 연박 유지: 이전에 쓴 호텔이 클러스터와 충분히 가까우면 재사용
-    # 연박 허용 거리도 walking_aversion에 따라 조정 (wa=5→6km, wa=1→15km)
-    max_reuse_km = 6 + (5 - walking_aversion) * 2.25
-    for h in sorted(hotels, key=hotel_score, reverse=True):
-        if h["name"] in used_hotels:
-            dist_to_cluster = _haversine(c_lat, c_lng, h["lat"], h["lng"])
-            if dist_to_cluster <= max_reuse_km:
-                return h
-
-    # 새 호텔 선택
-    return max(hotels, key=hotel_score)
-
-
-def _best_restaurant(
-    cluster: list[dict],
-    restaurants: list[dict],
-    used: set,
-    meal_type: str,
-    used_cuisines: list[str] = None,
-) -> Optional[dict]:
-    """
-    클러스터 중심에서 가까운 고점수 맛집 선택.
-    - 이미 쓴 맛집 제외
-    - 연속 같은 cuisine_type 피하기
-    """
-    if not restaurants:
-        return None
-
-    c_lat, c_lng = _centroid(cluster) if cluster else (37.5665, 126.978)
-    used_cuisines = used_cuisines or []
-
-    candidates = [r for r in restaurants if r["name"] not in used]
-    if not candidates:
-        candidates = list(restaurants)
-
-    def resto_score(r):
-        dist = _haversine(c_lat, c_lng, r["lat"], r["lng"])
-        dist_penalty = dist / 50
-        cuisine = r.get("features", {}).get("cuisine_type", "")
-        # 최근 2개 식사와 같은 cuisine이면 페널티
-        cuisine_penalty = 0.15 if cuisine and cuisine in used_cuisines[-2:] else 0
-        return r["node_score"] - dist_penalty - cuisine_penalty
-
-    return max(candidates, key=resto_score)
+        c_pen = 0.15 if cuisine and cuisine in (used_cuisines[-2:] if used_cuisines else []) else 0
+        p_bon = 0.1 if prefer_types and any(p in cuisine for p in prefer_types) else 0
+        fit = _meal_fitness(cuisine, meal_type)
+        return r["node_score"] - detour / 3.0 - c_pen + p_bon + fit
+    for pool_, cap in [(pool, max_dist), (pool, max_dist*2), (fallback, max_dist*2), (fallback, float("inf"))]:
+        avail = [r for r in pool_ if r["name"] not in used
+                 and price_range[0] <= (r.get("features",{}).get("avg_price_per_person",0) or 0) <= price_range[1]]
+        nearby = [(r, _haversine(p_lat, p_lng, r["lat"], r["lng"])) for r in avail]
+        nearby = [x for x in nearby if x[1] <= cap]
+        if nearby: return max(nearby, key=lambda x: score(x[0]))[0]
+    for pool_, cap in [(pool, max_dist*2), (fallback, float("inf"))]:
+        avail = [r for r in pool_ if r["name"] not in used]
+        nearby = [(r, _haversine(p_lat, p_lng, r["lat"], r["lng"])) for r in avail]
+        nearby = [x for x in nearby if x[1] <= cap]
+        if nearby: return max(nearby, key=lambda x: score(x[0]))[0]
+    return None
 
 
 # ──────────────────────────────────────────────
-# 일정 설명 생성 (Claude)
-# ──────────────────────────────────────────────
-def _generate_day_notes(day_plan: DayPlan, trip_info: dict) -> str:
-    """Claude로 하루 일정 설명 생성"""
-    morning_names = [a["name"] for a in day_plan.morning]
-    afternoon_names = [a["name"] for a in day_plan.afternoon]
-    lunch_name = day_plan.lunch["name"] if day_plan.lunch else "없음"
-    dinner_name = day_plan.dinner["name"] if day_plan.dinner else "없음"
-
-    prompt = f"""
-여행 일정 설명을 2~3문장으로 간결하게 써주세요.
-
-여행지: {trip_info['destination']}
-여행자: {trip_info['age_group']} {trip_info['traveler_count']}명
-
-Day {day_plan.day} 일정:
-- 숙소: {day_plan.hotel['name']}
-- 오전: {', '.join(morning_names) or '자유시간'}
-- 점심: {lunch_name}
-- 오후: {', '.join(afternoon_names) or '자유시간'}
-- 저녁: {dinner_name}
-
-동선과 분위기를 자연스럽게 설명해주세요. 이모지 없이 한국어로.
-"""
-    try:
-        resp = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text.strip()
-    except Exception:
-        return ""
-
-
-# ──────────────────────────────────────────────
-# 플래닝 에이전트 메인
+# 플래닝 에이전트
 # ──────────────────────────────────────────────
 class PlanningAgent:
-    def __init__(
-        self,
-        attractions_json: str,
-        restaurants_json: str,
-        hotels_json: str,
-        verbose: bool = True,
-    ):
+    def __init__(self, attractions_json, restaurants_json, hotels_json, verbose=True):
         self.verbose = verbose
-
-        with open(attractions_json, encoding="utf-8") as f:
-            a_data = json.load(f)
-        with open(restaurants_json, encoding="utf-8") as f:
-            r_data = json.load(f)
-        with open(hotels_json, encoding="utf-8") as f:
-            h_data = json.load(f)
-
+        with open(attractions_json, encoding="utf-8") as f: a_data = json.load(f)
+        with open(restaurants_json, encoding="utf-8") as f: r_data = json.load(f)
+        with open(hotels_json, encoding="utf-8") as f: h_data = json.load(f)
         self.trip = a_data.get("trip", {})
         self.attractions = a_data.get("attraction_nodes", [])
         self.restaurants = r_data.get("restaurant_nodes", [])
         self.hotels = h_data.get("hotel_nodes", [])
-
         self.duration = self.trip.get("duration_days", 4)
         self.checkin = self.trip.get("checkin", "")
 
-    def _log(self, msg: str):
-        if self.verbose:
-            print(f"[PlanningAgent] {msg}", flush=True)
+    def _log(self, msg):
+        if self.verbose: print(f"[PlanningAgent] {msg}", flush=True)
 
-    def run(self) -> dict:
-        self._log(f"일정 생성 시작 — {self.trip.get('destination')} {self.duration}박")
+    def run(self, n_variants=1):
+        if n_variants <= 1: return self._build_one(variant_idx=0)
+        results = []
+        for vi in range(n_variants):
+            self._log(f"\n{'='*50}\n  일정 {vi+1}/{n_variants} (variant {vi})\n{'='*50}")
+            r = self._build_one(variant_idx=vi); r["variant"] = vi + 1; results.append(r)
+        return results
 
-        # 1. 관광지 전처리 — 산/자연 최대 2개로 제한 (과부하 방지)
-        def _is_heavy(node: dict) -> bool:
-            cat = node.get("features", {}).get("category", "")
-            name = node.get("name", "")
-            return cat in {"자연", "등산"} or any(k in name for k in ["산", "등산", "트레킹"])
+    def _build_one(self, variant_idx=0):
+        self._log(f"일정 생성 — {self.trip.get('destination')} {self.duration}박")
+        prefs = self.trip.get("preferences", {})
+        food, budget = prefs.get("food", 3), self.trip.get("budget_krw", 1500000)
+        days_cnt, travelers = self.duration, self.trip.get("traveler_count", 2)
 
-        heavy_nodes = [n for n in self.attractions if _is_heavy(n)]
-        light_nodes = [n for n in self.attractions if not _is_heavy(n)]
+        dfb = budget * 0.30 / days_cnt / travelers
+        bk_max, ln_max, dn_max = int(dfb * 0.25), int(dfb * 0.60), int(dfb * 1.00)
+        max_dist = 1.5 + food * 0.7
 
-        # 산/자연은 score 상위 1개만 유지 (4박 기준)
-        max_heavy = max(1, self.duration // 4)
-        heavy_nodes_sorted = sorted(heavy_nodes, key=lambda x: x["node_score"], reverse=True)
-        filtered_attractions = light_nodes + heavy_nodes_sorted[:max_heavy]
-
-        if len(heavy_nodes) > max_heavy:
-            removed = [n["name"] for n in heavy_nodes_sorted[max_heavy:]]
-            self._log(f"  산/자연 노드 {len(removed)}개 제외: {removed}")
-
-        # 점수 순 정렬
-        filtered_attractions = sorted(filtered_attractions, key=lambda x: x["node_score"], reverse=True)
-
-        # 0. 대표 숙소 위치 파악 (클러스터링 시 참고용)
         best_hotel = max(self.hotels, key=lambda h: h["node_score"]) if self.hotels else None
-        hotel_loc = {"lat": best_hotel["lat"], "lng": best_hotel["lng"]} if best_hotel else None
+        valid_att = [n for n in self.attractions if _is_valid(n)]
+        seen, deduped = set(), []
+        for n in sorted(valid_att, key=lambda x: x["node_score"], reverse=True):
+            k = n.get("place_id") or n["name"].replace(" ", "").lower()
+            if k not in seen: seen.add(k); seen.add(n["name"].replace(" ", "").lower()); deduped.append(n)
 
-        # 1. 관광지 중복 제거 (place_id 기준)
-        def _norm(s: str) -> str:
-            return s.replace(" ", "").lower()
+        ordered, ca, cr = _plan_clusters(deduped, self.restaurants, best_hotel, self.duration, prefs, variant_idx)
 
-        seen_ids = set()
-        deduped = []
-        for n in filtered_attractions:
-            # place_id 우선, 없으면 정규화된 이름으로 중복 체크
-            pid = n.get("place_id") or _norm(n.get("name", ""))
-            if pid not in seen_ids:
-                seen_ids.add(pid)
-                # 이름도 추가로 체크 (표기 다른 동일 장소)
-                seen_ids.add(_norm(n.get("name", "")))
-                deduped.append(n)
-        filtered_attractions = deduped
-
-        # walking_aversion 추출 (없으면 기본값 3)
-        walking_aversion = self.trip.get("preferences", {}).get("walking_aversion", 3)
-        if isinstance(walking_aversion, str):
-            walking_aversion = 3
-
-        # 관광지 클러스터링 — 숙소 위치 + walking_aversion 반영
-        clusters = _cluster_by_day(
-            filtered_attractions, self.duration, hotel_loc, walking_aversion
-        )
-        self._log(f"  클러스터: {[len(c) for c in clusters]}개씩 배분")
-
-        # 2. 날짜별 일정 생성
-        days = []
-        used_restaurants: set = set()
-        used_hotel_names: list = []
-        used_cuisines: list = []   # 최근 식사 cuisine 추적 (다양성용)
+        for idx, cn in enumerate(ordered):
+            sel = _select_attractions(cn, ca.get(cn, []))
+            self._log(f"  Day{idx+1} [{cn}] 관광지후보={[a['name'] for a in sel]} 맛집={len(cr.get(cn,[]))}개")
 
         from datetime import datetime, timedelta
         base_date = datetime.strptime(self.checkin, "%Y-%m-%d") if self.checkin else datetime.now()
+        days, used_rest, used_hotels, used_cuisines = [], set(), [], []
 
-        for i, cluster in enumerate(clusters):
+        def fmt(h):
+            return f"{int(h):02d}:{int((h-int(h))*60):02d}"
+        def get_dur(n):
+            return n.get("features", {}).get("avg_duration_hr", 0) or 1.5
+
+        for i, cname in enumerate(ordered):
             day_num = i + 1
             date_str = (base_date + timedelta(days=i)).strftime("%Y-%m-%d")
+            next_cl = ordered[i+1] if i+1 < len(ordered) else None
 
-            # 숙소 선택 — walking_aversion 반영
-            hotel = _best_hotel_for_cluster(cluster, self.hotels, used_hotel_names, walking_aversion)
-            used_hotel_names.append(hotel.get("name", ""))
+            att_sel = _select_attractions(cname, ca.get(cname, []), n=4)
+            rest_pool = cr.get(cname, [])
+            hotel = _pick_hotel(cname, next_cl, self.hotels, used_hotels)
+            used_hotels.append(hotel.get("name", ""))
+            hp = {"lat": hotel.get("lat", 37.5665), "lng": hotel.get("lng", 126.978)}
 
-            # 관광지 중복 제거
-            def _normalize_name(name: str) -> str:
-                return name.replace(" ", "").replace("　", "").lower()
+            # ── 1단계: 관광지만 TSP 최적화 (2-opt) ──
+            optimized = _optimize_route_full(att_sel, hotel)
 
-            seen_names = set()
-            deduped_cluster = []
-            for n in cluster:
-                norm = _normalize_name(n.get("name", ""))
-                if norm not in seen_names:
-                    seen_names.add(norm)
-                    deduped_cluster.append(n)
+            # ── 2단계: 소요시간 cap ──
+            MAX_DAY_ATT_HR = 7.0
+            total_att_hr = sum(get_dur(a) for a in optimized)
+            scale = min(1.0, MAX_DAY_ATT_HR / total_att_hr) if total_att_hr > 0 else 1.0
 
-            # 동선 최적화: 숙소 위치 기반 nearest neighbor 재정렬
-            optimized = _optimize_route(deduped_cluster, hotel)
+            def pick(prev, nxt, pm, pt=None, mt=""):
+                return _pick_meal(prev, nxt, rest_pool, self.restaurants, used_rest, used_cuisines, max_dist, (0, pm), pt, meal_type=mt)
+            def reg(r):
+                if r:
+                    used_rest.add(r["name"])
+                    c = r.get("features", {}).get("cuisine_type", "")
+                    if c: used_cuisines.append(c)
 
-            morning = optimized[:2]
-            afternoon = optimized[2:4] if len(optimized) > 2 else []
+            # ── 3단계: 시간 흐름에 따라 관광지 배치 + 식사 삽입 ──
+            schedule = []
+            clock = 9.0
 
-            if len(optimized) == 1:
-                morning = optimized
-                afternoon = []
+            # 아침 (09:00, 숙소 → 첫 관광지 사이)
+            first = optimized[0] if optimized else hp
+            b = pick(hp, first, bk_max, mt="breakfast"); reg(b)
+            if b:
+                schedule.append(ScheduleItem(fmt(clock), "meal", "breakfast", b, 1.0))
+                clock += 1.0
 
-            # 연쇄 동선 기반 맛집 선택
-            # 점심: 오전 마지막 장소 → 오후 첫 장소 사이
-            morning_last = morning[-1] if morning else None
-            afternoon_first = afternoon[0] if afternoon else None
-            lunch = _best_restaurant_near(
-                morning_last, afternoon_first,
-                self.restaurants, used_restaurants, used_cuisines
-            )
-            if lunch:
-                used_restaurants.add(lunch["name"])
-                cuisine = lunch.get("features", {}).get("cuisine_type", "")
-                if cuisine:
-                    used_cuisines.append(cuisine)
+            # 관광지 순회하면서 시간대에 맞춰 식사 삽입
+            had_lunch = had_cafe = False
+            for ai, att in enumerate(optimized):
+                dur = round(get_dur(att) * scale, 1)
+                nxt = optimized[ai + 1] if ai + 1 < len(optimized) else hp
 
-            # 저녁: 오후 마지막 장소 → 숙소 사이
-            afternoon_last = afternoon[-1] if afternoon else morning_last
-            hotel_place = {"lat": hotel.get("lat", 37.5665), "lng": hotel.get("lng", 126.978)}
-            dinner = _best_restaurant_near(
-                afternoon_last, hotel_place,
-                self.restaurants, used_restaurants, used_cuisines
-            )
-            if dinner:
-                used_restaurants.add(dinner["name"])
-                cuisine = dinner.get("features", {}).get("cuisine_type", "")
-                if cuisine:
-                    used_cuisines.append(cuisine)
+                # 점심 (12:00~13:30 사이)
+                if not had_lunch and clock >= 12.0:
+                    prev = schedule[-1].node if schedule else hp
+                    l = pick(prev, att, ln_max, mt="lunch"); reg(l)
+                    if l:
+                        schedule.append(ScheduleItem(fmt(clock), "meal", "lunch", l, 1.0))
+                        clock += 1.0
+                    had_lunch = True
 
-            # 오후 비어있으면 근처 카페/디저트 맛집으로 채우기
-            if not afternoon:
-                cafe_candidates = [
-                    r for r in self.restaurants
-                    if r["name"] not in used_restaurants
-                    and any(k in r.get("features", {}).get("cuisine_type", "")
-                            for k in ["카페", "디저트", "커피", "베이커리", "케이크"])
-                ]
-                if cafe_candidates and cluster:
-                    c_lat, c_lng = _centroid(cluster)
-                    best_cafe = min(cafe_candidates, key=lambda r: _haversine(c_lat, c_lng, r["lat"], r["lng"]))
-                    # 카페를 오후 플레이스홀더로 사용
-                    cafe_slim = _slim(best_cafe)
-                    cafe_slim["type"] = "cafe"
-                    afternoon = [cafe_slim]
-                    used_restaurants.add(best_cafe["name"])
+                # 카페 (14:30~17:30 사이)
+                if not had_cafe and 14.5 <= clock <= 17.5:
+                    prev = schedule[-1].node if schedule else hp
+                    c = pick(prev, att, ln_max, pt=["카페","디저트","커피","베이커리"], mt="cafe"); reg(c)
+                    if c:
+                        schedule.append(ScheduleItem(fmt(clock), "cafe", "cafe", c, 0.5))
+                        clock += 0.5
+                    had_cafe = True
 
-            day_plan = DayPlan(
-                day=day_num,
-                date=date_str,
-                hotel=hotel,
-                morning=morning,
-                lunch=lunch,
-                afternoon=afternoon,
-                dinner=dinner,
-            )
+                # 관광지
+                schedule.append(ScheduleItem(fmt(clock), "attraction", "", att, dur))
+                clock += dur
 
-            # Claude로 일정 설명 생성
-            self._log(f"  Day {day_num} 설명 생성 중...")
-            day_plan.notes = _generate_day_notes(day_plan, self.trip)
+            # 보충: 아직 점심 못 먹었으면
+            if not had_lunch:
+                prev = schedule[-1].node if schedule else hp
+                l = pick(prev, hp, ln_max, mt="lunch"); reg(l)
+                if l:
+                    schedule.append(ScheduleItem(fmt(clock), "meal", "lunch", l, 1.0))
+                    clock += 1.0
 
-            days.append(day_plan)
-            self._log(f"  Day {day_num}: 오전={[a['name'] for a in morning]} 오후={[a['name'] for a in afternoon]} | 숙소: {hotel.get('name')}")
+            # 보충: 아직 카페 못 갔으면
+            if not had_cafe and clock <= 18.0:
+                prev = schedule[-1].node if schedule else hp
+                c = pick(prev, hp, ln_max, pt=["카페","디저트","커피","베이커리"], mt="cafe"); reg(c)
+                if c:
+                    schedule.append(ScheduleItem(fmt(clock), "cafe", "cafe", c, 0.5))
+                    clock += 0.5
 
-        # 3. 예산 요약
-        total_hotel = sum(
-            d.hotel["features"]["price_per_night"] * 1
-            for d in days
-        )
-        # 연박 중복 제거
+            # 저녁 (18:30~20:00, 마지막 관광지 → 숙소 방향)
+            last = schedule[-1].node if schedule else hp
+            d = pick(last, hp, dn_max, mt="dinner"); reg(d)
+            if d:
+                dinner_time = max(min(clock, 20.0), 18.5)
+                schedule.append(ScheduleItem(fmt(dinner_time), "meal", "dinner", d, 1.5))
+
+            concept = CLUSTER_CONCEPTS.get(cname, "")
+            atts = [s.node["name"] for s in schedule if s.type == "attraction"]
+            meals = [s.node["name"] for s in schedule if s.type in ("meal", "cafe")]
+            lms = [a for a in atts if any(lm.lower() in a.lower() or a.lower() in lm.lower() for lm in CLUSTER_LANDMARKS.get(cname, []))]
+            notes = f"{cname}({concept}) 탐방. {'필수 코스 ' + ', '.join(lms) + ' 포함. ' if lms else ''}{len(atts)}곳 관광, {len(meals)}곳 맛집."
+
+            dp = DayPlan(day=day_num, date=date_str, hotel=hotel, cluster_name=cname, schedule=schedule, notes=notes)
+            self._log(f"  Day{day_num} [{cname}] 관광={atts} 식사={meals}")
+            tl = " → ".join(f"{s.time} {s.node['name']}" for s in schedule)
+            self._log(f"  타임라인: {tl}")
+            days.append(dp)
+
         unique_hotels = {}
-        for d in days:
-            name = d.hotel["name"]
-            unique_hotels[name] = unique_hotels.get(name, 0) + 1
-        hotel_cost = sum(
-            h["features"]["price_per_night"] * nights
-            for h in self.hotels
-            for name, nights in unique_hotels.items()
-            if h["name"] == name
-        )
+        for d in days: unique_hotels[d.hotel["name"]] = unique_hotels.get(d.hotel["name"], 0) + 1
+        hotel_cost = sum(h["features"]["price_per_night"] * nights for h in self.hotels for name, nights in unique_hotels.items() if h["name"] == name)
 
-        result = {
+        return {
             "trip": self.trip,
             "summary": {
-                "total_days": self.duration,
-                "destination": self.trip.get("destination"),
-                "hotels_used": list(unique_hotels.keys()),
+                "total_days": self.duration, "destination": self.trip.get("destination"),
+                "cluster_plan": ordered, "hotels_used": list(unique_hotels.keys()),
                 "estimated_hotel_cost": hotel_cost,
                 "top_attractions": [a["name"] for a in sorted(self.attractions, key=lambda x: x["node_score"], reverse=True)[:5]],
                 "top_restaurants": [r["name"] for r in sorted(self.restaurants, key=lambda x: x["node_score"], reverse=True)[:5]],
             },
             "itinerary": [d.to_dict() for d in days],
         }
-
-        self._log(f"\n완료: {self.duration}일 일정 생성")
-        return result

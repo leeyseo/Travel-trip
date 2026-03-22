@@ -103,7 +103,7 @@ def build_queries(
 # ──────────────────────────────────────────────
 # Serper 검색
 # ──────────────────────────────────────────────
-def search_places(query: str, num: int = 5) -> list[SearchResult]:
+def search_places(query: str, num: int = 5, gl: str = "kr", hl: str = "ko") -> list[SearchResult]:
     if not SERPER_API_KEY:
         print("[WARN] SERPER_API_KEY not set → mock 데이터 사용")
         return _mock_results(query)
@@ -111,7 +111,7 @@ def search_places(query: str, num: int = 5) -> list[SearchResult]:
     try:
         resp = requests.post(
             SERPER_ENDPOINT,
-            json={"q": query, "num": num, "hl": "ko", "gl": "kr"},
+            json={"q": query, "num": num, "hl": hl, "gl": gl},
             headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
             timeout=10,
         )
@@ -123,6 +123,17 @@ def search_places(query: str, num: int = 5) -> list[SearchResult]:
     except requests.RequestException as e:
         print(f"[ERROR] Serper 실패: {e}")
         return []
+
+
+def search_places_en(query: str, num: int = 5) -> list[SearchResult]:
+    """영어 검색 전용 — 구글 US 결과 (TripAdvisor, Eater, TimeOut 등)"""
+    return search_places(query, num=num, gl="us", hl="en")
+
+
+def search_naver_blog(place_name: str, destination: str, num: int = 5) -> list[SearchResult]:
+    """네이버 블로그 전용 검색 — site:blog.naver.com 타겟"""
+    query = f"site:blog.naver.com {destination} {place_name} 후기 방문"
+    return search_places(query, num=num, gl="kr", hl="ko")
 
 
 # ──────────────────────────────────────────────
@@ -295,6 +306,46 @@ def fetch_text(url: str, max_chars: int = 4000, force_playwright: bool = False) 
 # ──────────────────────────────────────────────
 # 장소별 전체 텍스트 수집
 # ──────────────────────────────────────────────
+
+# ──────────────────────────────────────────────
+# Step 1 전용: 검색결과 페이지 크롤링 → 장소명 후보 텍스트 수집
+# ──────────────────────────────────────────────
+def collect_candidate_texts(
+    query: str,
+    num_results: int = 5,
+    gl: str = "kr",
+    hl: str = "ko",
+    max_chars: int = 3000,
+    delay: float = 0.3,
+) -> list[str]:
+    """
+    쿼리 1개 → 검색결과 페이지들을 실제 크롤링 → 본문 텍스트 리스트 반환.
+    snippet(150자) 대신 실제 페이지 본문을 읽어서 장소명을 더 많이 추출 가능.
+
+    Returns: 각 페이지의 본문 텍스트 리스트
+    """
+    if hl == "en":
+        results = search_places(query, num=num_results, gl=gl, hl=hl)
+    else:
+        results = search_places(query, num=num_results, gl=gl, hl=hl)
+
+    texts = []
+    for r in results[:num_results]:
+        # snippet이 충분히 길면 그냥 사용 (크롤링 시간 절약)
+        if len(r.snippet) >= 200:
+            texts.append(f"{r.title}\n{r.snippet}")
+            continue
+
+        # snippet 짧으면 실제 페이지 크롤링
+        time.sleep(delay)
+        fetched = fetch_text(r.url, max_chars=max_chars)
+        if fetched.text and len(fetched.text) > 100:
+            texts.append(f"{r.title}\n{fetched.text}")
+        elif r.snippet:
+            texts.append(f"{r.title}\n{r.snippet}")
+
+    return texts
+
 def collect_raw_text(
     destination: str,
     place_name: str,
@@ -304,41 +355,77 @@ def collect_raw_text(
     delay: float = 0.5,
 ) -> tuple[str, list[str]]:
     """
-    장소명으로 검색 → 각 URL fetch → 텍스트 합치기
+    장소명으로 다중 소스 수집:
+      1. 한국어 구글 검색 (네이버 블로그 포함)
+      2. 네이버 블로그 직접 타겟
+      3. 영어 구글 검색 (TripAdvisor, TimeOut 등)
     Returns (combined_text, source_urls)
     """
-    queries = [
+    # ── 1. 한국어 쿼리 ──
+    ko_queries = [
         f"{destination} {place_name} 후기 리뷰",
-        f"{place_name} 네이버 블로그 한국인",   # 네이버 블로그 명시적 타겟
+        f"{destination} {place_name} 방문 블로그",
     ]
     if extra_queries:
-        queries += extra_queries
+        ko_queries += [q for q in extra_queries if not q[0].isascii()]
+
+    # ── 2. 네이버 블로그 전용 ──
+    naver_queries = [
+        f"site:blog.naver.com {destination} {place_name} 후기",
+    ]
+
+    # ── 3. 영어 쿼리 ──
+    en_queries = [
+        f"{place_name} {destination} review guide",
+        f"{place_name} {destination} tripadvisor",
+    ]
+    if extra_queries:
+        en_queries += [q for q in extra_queries if q[0].isascii()]
 
     all_parts: list[str] = []
     source_urls: list[str] = []
+    seen_urls: set[str] = set()
+    MAX_TOTAL = 6  # 전체 소스 최대 6개 (한국어 3 + 영어 3 수준)
 
-    for query in queries[:2]:
-        results = search_places(query, num=3)
-        for r in results[:max_sources]:
+    def _process_results(results, lang_tag: str):
+        for r in results[:2]:  # 쿼리당 최대 2개
+            if len(all_parts) >= MAX_TOTAL:
+                return
+            if r.url in seen_urls:
+                continue
+            seen_urls.add(r.url)
 
-            # snippet만으로 충분하면 fetch 생략 (비용·시간 절약)
             if len(r.snippet) >= 300:
-                all_parts.append(f"[출처: {r.title}]\n{r.snippet}")
+                all_parts.append(f"[{lang_tag} | {r.title}]\n{r.snippet}")
                 source_urls.append(r.url)
-                r.fetch_method = "snippet_only"
                 continue
 
-            # snippet 부족 → 실제 fetch
             time.sleep(delay)
             result = fetch_text(r.url)
             if result.text:
-                all_parts.append(f"[출처: {r.title} | {result.method}]\n{result.text}")
+                all_parts.append(f"[{lang_tag} | {r.title} | {result.method}]\n{result.text}")
                 source_urls.append(r.url)
-                r.fetch_method = result.method
             elif r.snippet:
-                # fetch 실패해도 snippet은 사용
-                all_parts.append(f"[출처: {r.title} | fallback]\n{r.snippet}")
+                all_parts.append(f"[{lang_tag} | {r.title} | fallback]\n{r.snippet}")
                 source_urls.append(r.url)
+
+    # 한국어 검색
+    for query in ko_queries[:2]:
+        if len(all_parts) >= MAX_TOTAL: break
+        results = search_places(query, num=3, gl="kr", hl="ko")
+        _process_results(results, "KO")
+
+    # 네이버 블로그
+    for query in naver_queries:
+        if len(all_parts) >= MAX_TOTAL: break
+        results = search_places(query, num=3, gl="kr", hl="ko")
+        _process_results(results, "NAVER")
+
+    # 영어 검색
+    for query in en_queries[:2]:
+        if len(all_parts) >= MAX_TOTAL: break
+        results = search_places_en(query, num=3)
+        _process_results(results, "EN")
 
     combined = "\n\n---\n\n".join(all_parts)
     return combined, source_urls

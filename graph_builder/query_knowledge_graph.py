@@ -155,6 +155,7 @@ def query_and_plan(
     scoring_style: str,
     graph_dir: str,
     output_dir: str,
+    n_variants: int = 1,
 ) -> dict:
     graph_path = Path(graph_dir) / f"{destination}.json"
     if not graph_path.exists():
@@ -164,10 +165,11 @@ def query_and_plan(
     total_nodes = len(graph["nodes"])
     print(f"[Query] {destination} 그래프 로드 — 노드 {total_nodes}개")
 
-    # 카테고리별 필터링
-    attractions = filter_nodes(graph, age_group, preferences, budget_krw, "attraction", duration_days, top_n=20)
-    restaurants = filter_nodes(graph, age_group, preferences, budget_krw, "restaurant", duration_days, top_n=15)
-    hotels      = filter_nodes(graph, age_group, preferences, budget_krw, "hotel",      duration_days, top_n=10)
+    # 카테고리별 필터링 — 전체 통과 (예산 필터만 적용)
+    # 플래닝 에이전트가 클러스터별로 선택하므로 미리 잘라내지 않음
+    attractions = filter_nodes(graph, age_group, preferences, budget_krw, "attraction", duration_days, top_n=9999)
+    restaurants = filter_nodes(graph, age_group, preferences, budget_krw, "restaurant", duration_days, top_n=9999)
+    hotels      = filter_nodes(graph, age_group, preferences, budget_krw, "hotel",      duration_days, top_n=9999)
 
     print(f"  → 관광지 {len(attractions)}개 / 맛집 {len(restaurants)}개 / 숙소 {len(hotels)}개 필터링")
 
@@ -209,21 +211,32 @@ def query_and_plan(
 
         from agents.planning_agent import PlanningAgent
         agent = PlanningAgent(str(a_path), str(r_path), str(h_path), verbose=True)
-        result = agent.run()
+        result = agent.run(n_variants=n_variants)
 
-    result["trip"] = trip_dict
-    result["query_meta"] = {
+    meta = {
         "source": "knowledge_graph",
         "graph_nodes_total": total_nodes,
         "filtered": {"attraction": len(attractions), "restaurant": len(restaurants), "hotel": len(hotels)},
         "queried_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
 
-    # 저장
-    out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}.json"
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\n결과 저장 → {out_path}")
+
+    if n_variants <= 1:
+        # 단일 결과
+        result["trip"] = trip_dict
+        result["query_meta"] = meta
+        out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}.json"
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n결과 저장 → {out_path}")
+    else:
+        # 복수 결과 — 개별 파일 + 통합 파일
+        for i, r in enumerate(result):
+            r["trip"] = trip_dict
+            r["query_meta"] = meta
+            out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}_v{i+1}.json"
+            out_path.write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"\n결과 저장 → {out_path}")
 
     return result
 
@@ -240,6 +253,7 @@ if __name__ == "__main__":
                         help="평가 성향: balanced/threshold/peak/risk_averse/budget_safe")
     parser.add_argument("--graph-dir",   default="knowledge_graph")
     parser.add_argument("--output",      default="output")
+    parser.add_argument("--variants",    type=int, default=1, help="생성할 일정 수 (1~3)")
     args = parser.parse_args()
 
     # 나이대별 기본 취향
@@ -257,4 +271,5 @@ if __name__ == "__main__":
         scoring_style=args.style,
         graph_dir=args.graph_dir,
         output_dir=args.output,
+        n_variants=args.variants,
     )
