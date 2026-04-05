@@ -13,7 +13,7 @@ import anthropic
 from models.schemas import TripInput, PlaceNode, PlaceCategory, RestaurantFeatures
 from utils.web_collector import search_places, search_places_en, collect_raw_text, collect_candidate_texts
 from utils.feature_extractor import extract_features
-from utils.scorer import score_restaurant
+from utils.scorer import quality_score_restaurant
 
 client = anthropic.Anthropic()
 
@@ -32,12 +32,28 @@ def _build_queries(dest: str, age_str: str) -> list[dict]:
         {"q": f"{dest} 맛집 {age_str} 추천", "lang": "ko"},
         {"q": f"{dest} 카페 디저트 브런치 유명한 곳", "lang": "ko"},
         {"q": f"{dest} 미슐랭 맛집 가이드", "lang": "ko"},
+        # 동네별 쿼리 — 지역 편중 방지
+        {"q": f"여의도 맛집 추천 유명한 곳", "lang": "ko"},
+        {"q": f"마포 이태원 경리단길 맛집 추천", "lang": "ko"},
+        {"q": f"홍대 합정 망원동 맛집 카페", "lang": "ko"},
+        {"q": f"성수동 건대 뚝섬 맛집 추천", "lang": "ko"},
+        {"q": f"종로 을지로 광화문 맛집", "lang": "ko"},
+        {"q": f"강남 청담 압구정 파인다이닝 맛집", "lang": "ko"},
+        {"q": f"잠실 송파 방이동 맛집 추천", "lang": "ko"},
+        {"q": f"용산 한남동 이태원 숨은 맛집", "lang": "ko"},
+        # 음식 종류별 쿼리
+        {"q": f"{dest} 일식 스시 오마카세 맛집", "lang": "ko"},
+        {"q": f"{dest} 중식 딤섬 중국요리 맛집", "lang": "ko"},
+        {"q": f"{dest} 고급 레스토랑 파인다이닝", "lang": "ko"},
+        {"q": f"{dest} 가성비 맛집 혼밥 혼술", "lang": "ko"},
     ]
     en = [
         {"q": f"best food {dest} must eat", "lang": "en"},
         {"q": f"top restaurants {dest} tripadvisor locals", "lang": "en"},
         {"q": f"michelin restaurants {dest}", "lang": "en"},
         {"q": f"{dest} food guide what to eat", "lang": "en"},
+        {"q": f"best restaurants Hongdae Itaewon Seongsu {dest}", "lang": "en"},
+        {"q": f"hidden gem restaurants {dest} locals only", "lang": "en"},
     ]
     return ko + en
 
@@ -86,11 +102,16 @@ JSON 배열만 응답 (다른 텍스트 없이):
 # ──────────────────────────────────────────────
 class RestaurantBrowsingAgent:
     def __init__(self, trip: TripInput, max_places: int = 300,
-                 delay: float = 0.3, verbose: bool = True):
+                 delay: float = 0.3, verbose: bool = True,
+                 existing_names: set[str] | None = None,
+                 on_node_found=None, target_area: str = ""):
         self.trip = trip
         self.max_places = max_places
         self.delay = delay
         self.verbose = verbose
+        self.existing_names = existing_names or set()
+        self.on_node_found = on_node_found
+        self.target_area = target_area
 
     def _log(self, msg: str):
         if self.verbose:
@@ -103,6 +124,16 @@ class RestaurantBrowsingAgent:
                    "50s":"50대","60s":"60대","common":""}.get(age,"")
 
         queries = _build_queries(dest, age_str)
+        # target_area 지정 시 해당 지역 전용 쿼리 앞에 추가
+        if self.target_area:
+            area = self.target_area.strip()
+            extra = [
+                {"q": f"{area} 맛집 추천 유명한 곳", "lang": "ko"},
+                {"q": f"{area} 바 술집 나이트라이프 클럽", "lang": "ko"},
+                {"q": f"{area} 카페 브런치 디저트", "lang": "ko"},
+                {"q": f"best restaurants bars {area} Seoul", "lang": "en"},
+            ]
+            queries = extra + queries
         self._log(f"쿼리 {len(queries)}개 (한국어 {sum(1 for q in queries if q['lang']=='ko')}개 + 영어 {sum(1 for q in queries if q['lang']=='en')}개)")
 
         seen: set[str] = set()
@@ -206,7 +237,7 @@ class RestaurantBrowsingAgent:
         from utils.feature_extractor import _get_transit_score
         features.transit_access = _get_transit_score(lat, lng)[0]
 
-        score, breakdown = score_restaurant(features, self.trip.preferences)
+        score = quality_score_restaurant(features)
         self._log(f"  ✓ {place_name} → {score:.3f} ({features.cuisine_type}/{meal_type})")
 
         return PlaceNode(
@@ -216,7 +247,7 @@ class RestaurantBrowsingAgent:
             category=PlaceCategory.RESTAURANT,
             features=features,
             node_score=score,
-            score_breakdown=breakdown,
+            score_breakdown={},
             sources=sources[:3],
         )
 
@@ -233,10 +264,15 @@ class RestaurantBrowsingAgent:
             if len(nodes) >= self.max_places:
                 self._log(f"  목표 {self.max_places}개 달성, 중단")
                 break
+            if name in self.existing_names:
+                self._log(f"  [SKIP] {name} (기존 그래프에 존재)")
+                continue
             node = self._process_place(name)
             if node and node.place_id not in seen_ids:
                 seen_ids.add(node.place_id)
                 nodes.append(node)
+                if self.on_node_found:
+                    self.on_node_found(node)
             time.sleep(self.delay)
 
         nodes.sort(key=lambda n: n.node_score, reverse=True)

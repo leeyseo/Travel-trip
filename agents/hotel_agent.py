@@ -23,7 +23,7 @@ from models.schemas import (
 )
 from utils.web_collector import search_places, search_places_en, collect_raw_text, collect_candidate_texts, collect_candidate_texts
 from utils.feature_extractor import extract_features, DEFAULT_COORDS, COORD_BOUNDS
-from utils.scorer import score_hotel
+from utils.scorer import quality_score_hotel
 
 client = anthropic.Anthropic()
 KAKAO_KEY = os.environ.get("KAKAO_API_KEY", "")
@@ -228,13 +228,17 @@ JSON 배열만 응답 (다른 텍스트 없이):
 # 숙소 브라우징 에이전트
 # ──────────────────────────────────────────────
 class HotelBrowsingAgent:
-    def __init__(self, trip: TripInput, max_places: int = 10, delay: float = 0.3, verbose: bool = True, checkin: str = "", checkout: str = ""):
+    def __init__(self, trip: TripInput, max_places: int = 10, delay: float = 0.3, verbose: bool = True, checkin: str = "", checkout: str = "",
+                 existing_names: set[str] | None = None, on_node_found=None, target_area: str = ""):
         self.trip = trip
         self.max_places = max_places
         self.delay = delay
         self.verbose = verbose
         self.checkin = checkin
         self.checkout = checkout
+        self.existing_names = existing_names or set()
+        self.on_node_found = on_node_found
+        self.target_area = target_area
 
     def _log(self, msg: str):
         if self.verbose:
@@ -246,13 +250,33 @@ class HotelBrowsingAgent:
         age = {"20s":"20대","30s":"30대","40s":"40대","family":"가족"}.get(self.trip.age_group, "")
         budget = self.trip.budget_krw // self.trip.duration_days // self.trip.traveler_count
 
-        queries_ko = [
+        queries_ko = []
+        # target_area 지정 시 해당 지역 전용 쿼리 우선
+        if self.target_area:
+            area = self.target_area.strip()
+            queries_ko += [
+                f"{area} 호텔 추천 숙소",
+                f"{area} 호텔 위치 좋은 후기",
+                f"best hotels {area} Seoul",
+            ]
+        queries_ko += [
             f"{dest} 호텔 추천 {age} 2024",
             f"{dest} 숙소 한국인 후기 가성비",
             f"{dest} 호텔 베스트 위치 좋은",
             f"{dest} 럭셔리 호텔 5성급 추천",
             f"{dest} 부티크 호텔 감성 숙소 추천",
             f"{dest} 호텔 교통 좋은 지하철역 근처",
+            # 지역별 호텔
+            f"명동 중구 호텔 추천 교통 편리",
+            f"강남 서초 호텔 비즈니스 출장",
+            f"홍대 마포 부티크 호텔 감성숙소",
+            f"여의도 한강뷰 호텔 추천",
+            f"잠실 롯데 주변 호텔 추천",
+            f"이태원 한남동 호텔 게스트하우스",
+            # 유형별 호텔
+            f"{dest} 한옥 게스트하우스 숙소",
+            f"{dest} 호스텔 배낭여행 저렴한 숙소",
+            f"{dest} 풀빌라 스파 리조트형 호텔",
         ]
         queries_en = [
             f"best hotels {dest} 2024 travel guide",
@@ -260,6 +284,8 @@ class HotelBrowsingAgent:
             f"luxury hotels {dest} top rated",
             f"best value hotels {dest} tripadvisor",
             f"where to stay {dest} neighborhood guide",
+            f"best hotels Myeongdong Gangnam Hongdae {dest}",
+            f"budget hotels {dest} backpacker hostel",
         ]
 
         exclude_patterns = ["추천", "베스트", "top", "best", "리스트", "숙소", "호텔가"]
@@ -389,11 +415,7 @@ class HotelBrowsingAgent:
         else:
             self._log(f"  [가격] 네이버 실패 → LLM 추정 {features.price_per_night:,}원/박")
 
-        # 1박 예산 = 총 예산 / 박수 / 인원 * 0.4 (숙소에 40% 배분)
-        budget_per_night = int(
-            self.trip.budget_krw / self.trip.duration_days / self.trip.traveler_count * 0.4
-        )
-        score, breakdown = score_hotel(features, self.trip.preferences, budget_per_night)
+        score = quality_score_hotel(features)
         if score < 0.3:
             self._log(f"  [SKIP] score 낮음: {score:.3f}")
             return None
@@ -405,7 +427,7 @@ class HotelBrowsingAgent:
             category=PlaceCategory.HOTEL,
             features=features,
             node_score=score,
-            score_breakdown=breakdown,
+            score_breakdown={},
             sources=sources[:3],
         )
         self._log(f"  ✓ {hotel_name} → score={score:.3f}  ★{features.star_grade}  {transit_desc}")
@@ -423,9 +445,14 @@ class HotelBrowsingAgent:
             if len(nodes) >= self.max_places:
                 self._log(f"  목표 {self.max_places}개 달성, 중단")
                 break
+            if name in self.existing_names:
+                self._log(f"  [SKIP] {name} (기존 그래프에 존재)")
+                continue
             node = self._process_place(name)
             if node:
                 nodes.append(node)
+                if self.on_node_found:
+                    self.on_node_found(node)
             time.sleep(self.delay)
 
         nodes.sort(key=lambda n: n.node_score, reverse=True)

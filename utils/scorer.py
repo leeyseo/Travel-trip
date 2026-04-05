@@ -16,6 +16,7 @@ from models.schemas import (
 )
 
 
+
 @dataclass
 class ScoredFeature:
     name: str
@@ -209,6 +210,49 @@ def score_restaurant(
     )
     breakdown["scoring_style"] = style
     return final, breakdown
+
+
+# ──────────────────────────────────────────────
+# 수집 단계용 품질 점수 — 취향 무관, 객관적 수치만
+# (node_score로 저장; 쿼리 시 score_* 함수로 재계산)
+# ──────────────────────────────────────────────
+def quality_score_restaurant(features: RestaurantFeatures) -> float:
+    """평점·리뷰·미슐랭·맛·위생만 반영. 취향 가중치 없음."""
+    michelin_map = {"없음": 0, "빕구르망": 2.5, "1스타": 3.5, "2스타": 4.5, "3스타": 5.0}
+    michelin = normalize(michelin_map.get(features.michelin_tier, 0))
+    review_cred = min(1.0, features.review_count / 200)
+    score = (
+        normalize(features.overall_rating) * 0.40
+        + normalize(features.taste_score)   * 0.25
+        + normalize(features.cleanliness_score) * 0.15
+        + michelin                           * 0.10
+        + review_cred                        * 0.10
+    )
+    return round(min(1.0, score), 4)
+
+
+def quality_score_attraction(features: AttractionFeatures) -> float:
+    """평점·리뷰·포토·문화 깊이만 반영. 취향 가중치 없음."""
+    review_cred = min(1.0, features.review_count / 200)
+    score = (
+        normalize(features.overall_rating)   * 0.50
+        + normalize(features.photo_worthiness) * 0.20
+        + normalize(features.culture_depth)    * 0.20
+        + review_cred                          * 0.10
+    )
+    return round(min(1.0, score), 4)
+
+
+def quality_score_hotel(features: HotelFeatures) -> float:
+    """평점·리뷰·청결도·성급만 반영. 취향·예산 가중치 없음."""
+    review_cred = min(1.0, features.review_count / 200)
+    score = (
+        normalize(features.overall_rating)      * 0.45
+        + normalize(features.cleanliness_score) * 0.25
+        + normalize(features.star_grade)        * 0.20
+        + review_cred                           * 0.10
+    )
+    return round(min(1.0, score), 4)
 
 
 # ──────────────────────────────────────────────

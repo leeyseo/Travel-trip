@@ -287,6 +287,33 @@ def _geocode_nominatim(place_name: str, destination: str) -> tuple | None:
         print(f"  [Nominatim WARN] {place_name}: {e}")
     return None
 
+def get_precise_geo_info(place_name: str, destination: str):
+    """
+    카카오맵 API를 사용하여 장소의 공식 명칭, 도로명 주소, 좌표를 반환합니다.
+    """
+    kakao_key = os.environ.get("KAKAO_API_KEY", "")
+    if not kakao_key: return None
+    
+    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+    headers = {"Authorization": f"KakaoAK {kakao_key}"}
+    
+    # 검색 품질을 높이기 위해 지역명과 함께 검색
+    query = f"{destination} {place_name}"
+    try:
+        resp = requests.get(url, params={"query": query, "size": 1}, headers=headers, timeout=5)
+        docs = resp.json().get("documents", [])
+        if docs:
+            item = docs[0]
+            return {
+                "official_name": item["place_name"],
+                "address": item.get("road_address_name") or item["address_name"],
+                "lat": float(item["y"]),
+                "lng": float(item["x"]),
+                "kakao_category": item.get("category_name", ""),
+            }
+    except Exception as e:
+        print(f"  [Geo Error] {place_name}: {e}")
+    return None
 
 def _geocode(place_name: str, destination: str) -> tuple | None:
     """좌표 검색: 카카오맵 우선 → Nominatim 폴백"""

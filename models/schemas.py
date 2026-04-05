@@ -171,6 +171,7 @@ class TripInput:
     age_group: str          # "20s" | "30s" | "40s" | "family" | "senior"
     budget_krw: int
     preferences: TravelerPreferences
+    preference_text: str = ""   # 자연어 취향 설명 (임베딩 매칭에 사용)
 
     @classmethod
     def from_dict(cls, d: dict) -> "TripInput":

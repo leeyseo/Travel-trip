@@ -20,7 +20,7 @@ from models.schemas import (
 )
 from utils.web_collector import build_queries, search_places, search_places_en, collect_raw_text, collect_candidate_texts
 from utils.feature_extractor import extract_features
-from utils.scorer import score_attraction
+from utils.scorer import quality_score_attraction
 
 
 client = anthropic.Anthropic()
@@ -92,11 +92,13 @@ class AttractionBrowsingAgent:
         max_places: int = 10,
         delay: float = 0.3,
         verbose: bool = True,
+        target_area: str = "",
     ):
         self.trip = trip
         self.max_places = max_places
         self.delay = delay
         self.verbose = verbose
+        self.target_area = target_area  # 예: "강남 가로수길 청담"
 
     def _log(self, msg: str):
         if self.verbose:
@@ -114,12 +116,15 @@ class AttractionBrowsingAgent:
 
         # 한국어 + 영어 쿼리 병행
         queries_base = build_queries(dest, "attraction", age, prefs)
+        area = self.target_area.strip()
         extra_ko = [
-            f"{dest} 대표 관광지 여행지 추천",
-            f"{dest} 꼭 가야 할 명소 베스트",
-            f"{dest} 유명한 곳 여행 코스",
-            f"{dest} 관광지 {age_str} 추천",
+            f"{dest} {area} 대표 관광지 여행지 추천" if area else f"{dest} 대표 관광지 여행지 추천",
+            f"{dest} {area} 꼭 가야 할 명소 베스트" if area else f"{dest} 꼭 가야 할 명소 베스트",
+            f"{dest} {area} 유명한 곳 여행 코스" if area else f"{dest} 유명한 곳 여행 코스",
+            f"{dest} {area} 관광지 {age_str} 추천" if area else f"{dest} 관광지 {age_str} 추천",
         ]
+        if area:
+            extra_ko += [f"{area} 관광지 명소 추천", f"{area} 가볼만한 곳"]
         queries_ko = queries_base
         queries_en_raw = [
             f"top tourist attractions {dest} must visit",
@@ -231,7 +236,7 @@ class AttractionBrowsingAgent:
         features.transit_access = transit_score
         self._log(f"  [교통] {transit_desc} → {transit_score}/5")
 
-        score, breakdown = score_attraction(features, self.trip.preferences)
+        score = quality_score_attraction(features)
 
         node = PlaceNode(
             place_id=_make_place_id(place_name, dest),
@@ -240,7 +245,7 @@ class AttractionBrowsingAgent:
             category=PlaceCategory.ATTRACTION,
             features=features,
             node_score=score,
-            score_breakdown=breakdown,
+            score_breakdown={},
             sources=sources[:3],
         )
         self._log(f"  ✓ {place_name} → score={score:.3f}")

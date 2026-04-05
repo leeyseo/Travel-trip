@@ -16,7 +16,6 @@ load_dotenv()
 
 import json
 import argparse
-import math
 from pathlib import Path
 from datetime import datetime
 
@@ -26,36 +25,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # ──────────────────────────────────────────────
 # 유저 조건 → 최적 나이대 매핑
 # ──────────────────────────────────────────────
-def map_to_age_group(age_group: str, available_groups: list[str]) -> list[str]:
-    """
-    유저 나이대에서 그래프에 있는 나이대로 매핑.
-    정확히 있으면 그것만, 없으면 인접 나이대로 fallback.
-    """
-    age_order = ["20s", "30s", "40s", "50s", "60s"]
-
-    if age_group in available_groups:
-        return [age_group]
-
-    # 인접 나이대 fallback
-    if age_group in age_order:
-        idx = age_order.index(age_group)
-        candidates = []
-        if idx > 0 and age_order[idx-1] in available_groups:
-            candidates.append(age_order[idx-1])
-        if idx < len(age_order)-1 and age_order[idx+1] in available_groups:
-            candidates.append(age_order[idx+1])
-        if candidates:
-            return candidates
-
-    return available_groups[:1]
-
-
 # ──────────────────────────────────────────────
 # 그래프에서 노드 필터링 + 점수 재계산
 # ──────────────────────────────────────────────
 def filter_nodes(
     graph: dict,
-    age_group: str,
     preferences: dict,
     budget_krw: int,
     category: str,
@@ -64,72 +38,57 @@ def filter_nodes(
 ) -> list[dict]:
     """
     그래프에서 조건에 맞는 노드 필터링.
-    - age_group에서 뽑힌 노드 우선
-    - 없으면 인접 나이대 노드
-    - 점수 재계산 (유저 취향 가중치 적용)
+    - 카테고리 필터 + 예산 필터
+    - 유저 preferences로 score_* 재호출 → 취향 반영 랭킹
     """
+    from models.schemas import (
+        TravelerPreferences, RestaurantFeatures, AttractionFeatures, HotelFeatures
+    )
+    from utils.scorer import score_restaurant, score_attraction, score_hotel
+
+    prefs_obj = TravelerPreferences(**preferences)
+
     all_nodes = list(graph["nodes"].values())
-    available_ages = list(set(
-        age for node in all_nodes
-        for age in node.get("meta", {}).get("seen_in_age_groups", [])
-    ))
-
-    target_ages = map_to_age_group(age_group, available_ages)
-
-    # 카테고리 필터
     candidates = [n for n in all_nodes if n.get("category") == category]
 
-    # 나이대 필터 (해당 나이대에서 뽑힌 것만)
-    age_filtered = [
-        n for n in candidates
-        if any(age in n.get("meta", {}).get("seen_in_age_groups", []) for age in target_ages)
-    ]
-
-    if not age_filtered:
-        age_filtered = candidates  # fallback: 전체
-
-    # 점수 재계산
     def calc_score(node: dict) -> float:
-        meta = node.get("meta", {})
-        age_scores = meta.get("age_scores", {})
+        pull_bonus = min(node.get("meta", {}).get("pull_count", 1) * 0.01, 0.05)
+        feat = node.get("features", {})
 
-        # 해당 나이대 점수
-        base_score = max(
-            (age_scores.get(age, 0) for age in target_ages),
-            default=node.get("node_score", 0.5)
-        )
+        try:
+            if category == "restaurant":
+                price = feat.get("avg_price_per_person", 0)
+                if price > 0:
+                    meal_budget = budget_krw * 0.30 / (duration_days * 2)
+                    scoring_style = preferences.get("scoring_style", "balanced")
+                    multiplier = 6 if scoring_style == "peak" else 3
+                    if price > meal_budget * multiplier:
+                        return -1.0
+                features = RestaurantFeatures(**feat)
+                base_score, _ = score_restaurant(features, prefs_obj)
 
-        # pull_count 보너스 (많이 뽑힐수록 신뢰도 높음)
-        pull_bonus = min(meta.get("pull_count", 1) * 0.01, 0.05)
-
-        # 맛집: 1끼 예산 상한 필터링
-        # 총예산의 30%를 식비(끼니당)로 배분
-        # balanced/기본 → 상한 3배 / peak → 상한 6배 (극강 경험 허용)
-        if category == "restaurant":
-            price = node.get("features", {}).get("avg_price_per_person", 0)
-            if price > 0:
-                meal_budget = budget_krw * 0.30 / (duration_days * 2)
-                scoring_style = preferences.get("scoring_style", "balanced")
-                multiplier = 6 if scoring_style == "peak" else 3
-                if price > meal_budget * multiplier:
+            elif category == "hotel":
+                price = feat.get("price_per_night", 100000)
+                budget_per_night = budget_krw / duration_days * 0.4
+                if price > budget_per_night * 1.5:
                     return -1.0
+                features = HotelFeatures(**feat)
+                base_score, _ = score_hotel(features, prefs_obj, int(budget_per_night))
 
-        # 숙소: 예산 필터링
-        if category == "hotel":
-            price = node.get("features", {}).get("price_per_night", 100000)
-            # 1박 예산 = 총예산 / 박수 * 40% (숙박 배분 비율)
-            budget_per_night = budget_krw / duration_days * 0.4
-            # 예산 1.5배 초과 시 제외 (기존 2배 → 1.5배로 강화)
-            if price > budget_per_night * 1.5:
-                return -1.0
-            # 예산 범위 내에서 가까울수록 높은 점수
-            budget_fit = max(0, 1 - abs(price - budget_per_night) / max(budget_per_night, 1))
-            return base_score * 0.5 + budget_fit * 0.5 + pull_bonus
+            elif category == "attraction":
+                features = AttractionFeatures(**feat)
+                base_score, _ = score_attraction(features, prefs_obj)
+
+            else:
+                base_score = node.get("node_score", 0.5)
+
+        except Exception:
+            base_score = node.get("node_score", 0.5)
 
         return base_score + pull_bonus
 
-    scored = [(n, calc_score(n)) for n in age_filtered]
-    scored = [(n, s) for n, s in scored if s >= 0]  # 예산 초과 제외
+    scored = [(n, calc_score(n)) for n in candidates]
+    scored = [(n, s) for n, s in scored if s >= 0]
     scored.sort(key=lambda x: x[1], reverse=True)
 
     result = []
@@ -156,6 +115,7 @@ def query_and_plan(
     graph_dir: str,
     output_dir: str,
     n_variants: int = 1,
+    preference_text: str = "",
 ) -> dict:
     graph_path = Path(graph_dir) / f"{destination}.json"
     if not graph_path.exists():
@@ -167,28 +127,14 @@ def query_and_plan(
 
     # 카테고리별 필터링 — 전체 통과 (예산 필터만 적용)
     # 플래닝 에이전트가 클러스터별로 선택하므로 미리 잘라내지 않음
-    attractions = filter_nodes(graph, age_group, preferences, budget_krw, "attraction", duration_days, top_n=9999)
-    restaurants = filter_nodes(graph, age_group, preferences, budget_krw, "restaurant", duration_days, top_n=9999)
-    hotels      = filter_nodes(graph, age_group, preferences, budget_krw, "hotel",      duration_days, top_n=9999)
+    attractions = filter_nodes(graph, preferences, budget_krw, "attraction", duration_days, top_n=9999)
+    restaurants = filter_nodes(graph, preferences, budget_krw, "restaurant", duration_days, top_n=9999)
+    hotels      = filter_nodes(graph, preferences, budget_krw, "hotel",      duration_days, top_n=9999)
 
     print(f"  → 관광지 {len(attractions)}개 / 맛집 {len(restaurants)}개 / 숙소 {len(hotels)}개 필터링")
 
     # 임시 JSON으로 플래닝 에이전트에 전달
-    import tempfile, os
-    from models.schemas import TripInput, TravelerPreferences
-
-    # scoring_style 주입
-    prefs_with_style = dict(preferences)
-    prefs_with_style["scoring_style"] = scoring_style
-    prefs_obj = TravelerPreferences(**prefs_with_style)
-    trip = TripInput(
-        destination=destination,
-        duration_days=duration_days,
-        traveler_count=traveler_count,
-        age_group=age_group,
-        budget_krw=budget_krw,
-        preferences=prefs_obj,
-    )
+    import tempfile
 
     trip_dict = {
         "destination": destination,
@@ -197,7 +143,8 @@ def query_and_plan(
         "age_group": age_group,
         "budget_krw": budget_krw,
         "checkin": checkin,
-        "preferences": preferences,
+        "preferences": {**preferences, "scoring_style": scoring_style},
+        "preference_text": preference_text,
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -210,7 +157,7 @@ def query_and_plan(
         h_path.write_text(json.dumps({"trip": trip_dict, "hotel_nodes": hotels}, ensure_ascii=False), encoding="utf-8")
 
         from agents.planning_agent import PlanningAgent
-        agent = PlanningAgent(str(a_path), str(r_path), str(h_path), verbose=True)
+        agent = PlanningAgent(str(a_path), str(r_path), str(h_path), graph_json=str(graph_path), verbose=True)
         result = agent.run(n_variants=n_variants)
 
     meta = {
@@ -229,16 +176,26 @@ def query_and_plan(
         out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}.json"
         out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n결과 저장 → {out_path}")
+        return result
     else:
-        # 복수 결과 — 개별 파일 + 통합 파일
+        # 복수 결과를 하나의 JSON 구조로 통합
+        combined_result = {
+            "trip": trip_dict,
+            "query_meta": meta,
+            "variants": []
+        }
+        
         for i, r in enumerate(result):
-            r["trip"] = trip_dict
-            r["query_meta"] = meta
-            out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}_v{i+1}.json"
-            out_path.write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(f"\n결과 저장 → {out_path}")
+            combined_result["variants"].append({
+                "variant_id": i + 1,
+                "summary": r.get("summary", {}),
+                "itinerary": r.get("itinerary", [])
+            })
 
-    return result
+        out_path = Path(output_dir) / f"{destination}_itinerary_{age_group}_combined.json"
+        out_path.write_text(json.dumps(combined_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n통합 결과 저장 → {out_path}")
+        return combined_result
 
 
 if __name__ == "__main__":
@@ -254,11 +211,60 @@ if __name__ == "__main__":
     parser.add_argument("--graph-dir",   default="knowledge_graph")
     parser.add_argument("--output",      default="output")
     parser.add_argument("--variants",    type=int, default=1, help="생성할 일정 수 (1~3)")
+    parser.add_argument("--preference-text", default="", help="자연어 취향 설명 (인스타 결과에 추가 합산)")
+    parser.add_argument("--instagram", default="", help="인스타그램 URL 또는 @username — 피드 분석으로 취향 자동 추출")
+    # 개별 취향 수치 오버라이드 (1~5, 미지정 시 나이대/인스타 기본값 사용)
+    parser.add_argument("--food",             type=int, default=None, help="음식/맛집 관심도 (1~5)")
+    parser.add_argument("--culture",          type=int, default=None, help="역사/문화/박물관 관심도 (1~5)")
+    parser.add_argument("--nature",           type=int, default=None, help="자연/공원/힐링 관심도 (1~5)")
+    parser.add_argument("--activity",         type=int, default=None, help="액티비티/체험 관심도 (1~5)")
+    parser.add_argument("--nightlife",        type=int, default=None, help="나이트라이프/술 관심도 (1~5)")
+    parser.add_argument("--shopping",         type=int, default=None, help="쇼핑 관심도 (1~5)")
+    parser.add_argument("--cleanliness",      type=int, default=None, help="위생/청결 민감도 (1~5)")
+    parser.add_argument("--walking-aversion", type=int, default=None, help="도보 이동 기피도 (1~5, 5=이동 싫어함)")
     args = parser.parse_args()
 
     # 나이대별 기본 취향
     from graph_builder.build_knowledge_graph import AGE_PROFILES
     prefs = AGE_PROFILES.get(args.age, AGE_PROFILES["30s"])["preferences"]
+
+    # --instagram: 피드 분석으로 취향 덮어쓰기
+    preference_text = args.preference_text
+    if args.instagram:
+        from utils.instagram_analyzer import analyze_instagram
+        try:
+            ig = analyze_instagram(args.instagram)
+            prefs = {**prefs, **ig["preferences"]}
+            # preference_text: 인스타 결과 + 수동 입력 합산
+            ig_text = ig["preference_text"]
+            preference_text = f"{ig_text} {preference_text}".strip() if preference_text else ig_text
+            args.style = ig["scoring_style"]
+            print(f"[Instagram] @{ig['username']} 취향 적용: {ig['summary']}")
+            print(f"  preference_text: {preference_text}")
+            print(f"  scoring_style:   {args.style}")
+        except Exception as e:
+            print(f"[Instagram] 분석 실패: {e} → 기본 취향으로 진행")
+
+    # 개별 취향 수치 오버라이드 (--food, --culture 등 명시된 항목만 덮어씀)
+    PREF_OVERRIDES = {
+        "food": args.food, "culture": args.culture, "nature": args.nature,
+        "activity": args.activity, "nightlife": args.nightlife, "shopping": args.shopping,
+        "cleanliness": args.cleanliness, "walking_aversion": args.walking_aversion,
+    }
+    overridden = []
+    for key, val in PREF_OVERRIDES.items():
+        if val is not None:
+            prefs[key] = max(1, min(5, val))
+            overridden.append(f"{key}={val}")
+    if overridden:
+        print(f"[취향 오버라이드] {', '.join(overridden)}")
+
+    # --style 유효성 검사
+    VALID_STYLES = {"balanced", "threshold", "peak", "risk_averse", "budget_safe"}
+    if args.style not in VALID_STYLES:
+        print(f"[경고] 알 수 없는 style '{args.style}' → 'balanced'로 대체")
+        print(f"       유효한 옵션: {', '.join(sorted(VALID_STYLES))}")
+        args.style = "balanced"
 
     query_and_plan(
         destination=args.destination,
@@ -272,4 +278,5 @@ if __name__ == "__main__":
         graph_dir=args.graph_dir,
         output_dir=args.output,
         n_variants=args.variants,
+        preference_text=preference_text,
     )
